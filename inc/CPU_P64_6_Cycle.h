@@ -71,6 +71,8 @@ public:
         uint64_t stalls{0};
         uint64_t branches{0};
         uint64_t branch_mispredicts{0};
+        // Diagnostic split of branch_mispredicts by kind (EX + ID sites)
+        uint64_t mp_cond{0}, mp_jal{0}, mp_ret{0}, mp_jalr{0}, mp_alias{0};
         uint64_t flushes{0};
         uint64_t forwarded_reads{0};     // Phase 1: RAW hazards resolved by forwarding
         uint64_t load_store_forwards{0}; // Phase 2: Loads satisfied from store buffer
@@ -242,6 +244,8 @@ private:
     // BTB redirect latency). Set when PCGen predicts taken; consumed as a bubble
     // on the next PCGen cycle.
     bool taken_redirect_bubble{false};
+    bool flush_is_branch_mispredict{false};
+  int mul_waw_rd{-1}; // rd of a multiply that completed this cycle (WAW bubble, BUGS §B12) // set with flush_pipeline only for branch/jump mispredicts (B6 bubble scope)
  
     // Scoreboard — unified issue FIFO + reorder buffer + rd_clobber (CVA6-aligned).
     // Replaces the separate bool scoreboard[32] and ReorderBuffer<32> rob.
@@ -272,6 +276,24 @@ private:
 
     // Return Address Stack (RAS), 4-entry LIFO
     std::vector<uint64_t> ras;
+
+    // CVA6-faithful predictor (VP_BP=cva6), from cva6/core/frontend/:
+    // instr_scan decodes the fetched instruction; jal always taken; branches
+    // use a BHT (valid bit + 2-bit counter, reset 00, pc[7:1]) or the static
+    // backward-taken rule, target from the immediate; returns use a 2-entry
+    // RAS that is never flushed; other jalr use a tagless BTB (pc[5:1]).
+    // bht.sv resets every entry to '0 (valid=0, counter=00); the 2'b10 seen in the
+    // flush branch is unreachable because the frontend ties flush_bp_i to 0.
+    struct Cva6Bht { bool valid{false}; uint8_t ctr{0}; };
+    struct Cva6Btb { bool valid{false}; uint64_t target{0}; };
+    struct Cva6Ras { bool valid{false}; uint64_t ra{0}; };
+    Cva6Bht c6_bht[128];
+    Cva6Btb c6_btb[32];
+    Cva6Ras c6_ras[2];
+    bool bp_cva6{true};    // CVA6 frontend rules (VP_BP=legacy for the old predictor)
+    bool cva6_predict(uint64_t pc, uint32_t instr, bool is_c, uint64_t &target);
+    bool fetch_fault_nonspeculative() const;
+    static bool cva6_is_return(uint32_t instr, bool is_c);
 
     // =========================================================================
     // Statistics (Moved to public section)
@@ -367,6 +389,14 @@ private:
     void trace_dcache_access(uint64_t addr) {
         if (dcache_trace_file) std::fprintf(dcache_trace_file, "%lx\n", (unsigned long)addr);
     }
+
+    // Same idea, I$ side (VP_ICACHE_TRACE=<path> env var) -- every fetch
+    // PC, for an I$-geometry exploration tool mirroring tools/cache_sweep/.
+    // Same purely-diagnostic sink, zero effect when unset.
+    std::FILE* icache_trace_file{nullptr};
+    void trace_icache_access(uint64_t addr) {
+        if (icache_trace_file) std::fprintf(icache_trace_file, "%lx\n", (unsigned long)addr);
+    }
     bool dcache_miss_fu_full() const {
         for (int i = 0; i < dcache_miss_slots_active; i++) if (!dcache_miss_fu[i].busy) return false;
         return true;
@@ -379,7 +409,36 @@ private:
         for (int i = 0; i < dcache_miss_slots_active; i++) if (!dcache_miss_fu[i].busy) return i;
         return -1;
     }
-    FunctionalUnitState load_hit_fu;   // 1-cycle load-use stall (D$ hit / store-buf forward)
+    // D$-hit / store-buffer-forward load latency, as a small pipeline so loads can
+    // issue every cycle (CVA6's load unit is pipelined). Slots = load_hit_penalty:
+    // at the default (1) this is the original single-slot unit, bit-identical.
+    // VP_LOAD_LAT=N raises the hit latency (see docs/BUGS.md §B11).
+    static constexpr int LOAD_HIT_SLOTS = 4;
+    FunctionalUnitState load_hit_pipe[LOAD_HIT_SLOTS];
+    int load_hit_slots_active{2};
+    int dmiss_extra{5};   // D$ miss fill tail after the AXI refill; result usable after it (VP_DMISS_EXTRA)
+    int dmiss_block{3};   // of those, cycles the miss path stays occupied (VP_DMISS_BLOCK)
+    static constexpr int DMISS_HOLD = -2; // trans_id marker: slot only holding for the fill
+    // Results of D$ misses whose refill has returned but whose fill tail
+    // (dmiss_extra) is still running; the miss slot itself is already free.
+    static constexpr int DMISS_TAIL_SLOTS = 4;
+    FunctionalUnitState dmiss_tail[DMISS_TAIL_SLOTS];
+    bool dmiss_tail_any_busy() const {
+        for (const auto &d : dmiss_tail) if (d.busy) return true;
+        return false;
+    }
+    bool load_hit_full() const {
+        for (int i = 0; i < load_hit_slots_active; i++) if (!load_hit_pipe[i].busy) return false;
+        return true;
+    }
+    bool load_hit_any_busy() const {
+        for (int i = 0; i < LOAD_HIT_SLOTS; i++) if (load_hit_pipe[i].busy) return true;
+        return false;
+    }
+    int load_hit_free_slot() const {
+        for (int i = 0; i < load_hit_slots_active; i++) if (!load_hit_pipe[i].busy) return i;
+        return -1;
+    }
 
     struct FetchQueueEntry {
         uint64_t pc{0};
@@ -398,8 +457,17 @@ private:
     // = 16 B lines, 256 sets):
     //   I$: 16 KB, 4-way, 16 B lines  (256 sets × 4 ways × 16 B)
     //   D$: 32 KB, 8-way, 16 B lines  (256 sets × 8 ways × 16 B)
+    // D$ geometry is overridable at build time for line-width / bus-width
+    // experiments (e.g. -DVP_DCACHE_LINE_BYTES=128 -DVP_DCACHE_SETS=32 keeps
+    // 32 KB). Defaults are the CVA6 values above.
+#ifndef VP_DCACHE_SETS
+#define VP_DCACHE_SETS 256
+#endif
+#ifndef VP_DCACHE_LINE_BYTES
+#define VP_DCACHE_LINE_BYTES 16
+#endif
     Cache<256, 4, 16> icache;
-    Cache<256, 8, 16> dcache;
+    Cache<VP_DCACHE_SETS, 8, VP_DCACHE_LINE_BYTES> dcache;
 
 #ifdef ENABLE_AXI_CONTENTION
     // Real matchlib AxiArbiter I$/D$ contention subsystem (CYCLE6_AXI build).
@@ -419,7 +487,7 @@ private:
     int dcache_miss_penalty{10};   // Settable before sc_start()
     int store_drain_remaining{0};  // Active write-through store cycles remaining
     int store_write_penalty{0};   // 0-cycle write-back store drain latency
-    int load_hit_penalty{1};       // 1-cycle load-use stall on hits (L1 D$ latency)
+    int load_hit_penalty{2};       // D$-hit load-use stall: RTL hit latency is 3 cycles, pipelined (§B11)
     // Extra cycles when a load result feeds a subsequent load/store ADDRESS
     // (gather / pointer-chase). CVA6 routes a load result to address-generation
     // ~2 cycles slower than to an ALU op; the VP under-charged this. Measured

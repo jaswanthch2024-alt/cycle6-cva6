@@ -38,7 +38,19 @@ namespace riscv_tlm {
 template<std::size_t SETS = 64, std::size_t WAYS = 4, std::size_t LINE_BYTES = 64>
 class Cache {
 public:
-    enum class Policy { LFSR, LRU };
+    // Exposes the line size to callers outside the template (e.g. the AXI
+    // refill-burst-length calculation), since a non-type template parameter
+    // isn't otherwise nameable as Cache<...>::LINE_BYTES from outside.
+    static constexpr std::size_t LineBytes = LINE_BYTES;
+
+    // MRU, PLRU, NRU, LFU are comparison-only additions (like LRU above,
+    // NOT a second CVA6-accurate mode) -- ported from the verified
+    // tools/cache_sweep/RuntimeCache.h implementations (see that file's
+    // header comment for per-policy motivation and its hand-traced
+    // correctness tests) so VP_CACHE_POLICY comparisons can run on the
+    // real, cycle-accurate pipeline instead of only the standalone
+    // hit-rate exploration tool.
+    enum class Policy { LFSR, LRU, MRU, PLRU, NRU, LFU };
 
     Cache() = default;
 
@@ -58,9 +70,13 @@ public:
 
         auto& s = sets[idx];
 
-        for (auto& line : s) {
+        for (std::size_t w = 0; w < WAYS; w++) {
+            auto& line = s[w];
             if (line.valid && line.tag == tag) {
-                line.lru_time = total_accesses; // only consulted in LRU mode
+                line.lru_time = total_accesses; // only consulted in LRU/MRU mode
+                line.ref_bit = true;            // only consulted in NRU mode
+                line.freq++;                    // only consulted in LFU mode
+                if (policy_ == Policy::PLRU) plru_mark_mru(idx, w);
                 total_hits++;
                 return true;
             }
@@ -77,6 +93,25 @@ public:
                 victim = 0;
                 for (std::size_t w = 1; w < WAYS; w++)
                     if (s[w].lru_time < s[victim].lru_time) victim = w;
+            } else if (policy_ == Policy::MRU) {
+                // Mirror image of LRU: evict the MOST recently touched way.
+                victim = 0;
+                for (std::size_t w = 1; w < WAYS; w++)
+                    if (s[w].lru_time > s[victim].lru_time) victim = w;
+            } else if (policy_ == Policy::PLRU) {
+                victim = plru_find_victim(idx);
+            } else if (policy_ == Policy::NRU) {
+                victim = WAYS;
+                for (std::size_t w = 0; w < WAYS; w++)
+                    if (!s[w].ref_bit) { victim = w; break; }
+                if (victim == WAYS) {
+                    for (std::size_t w = 0; w < WAYS; w++) s[w].ref_bit = false;
+                    victim = 0;
+                }
+            } else if (policy_ == Policy::LFU) {
+                victim = 0;
+                for (std::size_t w = 1; w < WAYS; w++)
+                    if (s[w].freq < s[victim].freq) victim = w;
             } else {
                 // LFSR (mirrors CVA6's update_lfsr = cache_wren & all_ways_valid).
                 victim = static_cast<std::size_t>(lfsr) % WAYS;   // rnd_way
@@ -85,7 +120,8 @@ public:
                 lfsr = static_cast<uint8_t>((lfsr << 1) | fb);
             }
         }
-        s[victim] = {true, tag, total_accesses};
+        s[victim] = {true, tag, total_accesses, true, 1};
+        if (policy_ == Policy::PLRU) plru_mark_mru(idx, victim);
         return false;
     }
 
@@ -108,8 +144,35 @@ private:
     struct Line {
         bool     valid{false};
         uint64_t tag{0};
-        uint64_t lru_time{0}; // only maintained/consulted in LRU mode
+        uint64_t lru_time{0}; // only maintained/consulted in LRU/MRU mode
+        bool     ref_bit{false}; // only maintained/consulted in NRU mode
+        uint64_t freq{0};        // only maintained/consulted in LFU mode
     };
+
+    // Tree-PLRU helpers (WAYS is asserted power-of-2 elsewhere in this
+    // project's Cache<> usages; a complete binary tree of WAYS-1 one-bit
+    // nodes covers exactly WAYS leaves). Bit convention: bits[node]==0
+    // means "descend left on eviction" (the right subtree was more
+    // recently touched), ==1 means "descend right". Ported verbatim from
+    // tools/cache_sweep/RuntimeCache.h (see that file for the hand-traced
+    // correctness proof).
+    static constexpr int WAYS_LOG2 = Cache::log2c(WAYS);
+    std::size_t plru_find_victim(std::size_t set_idx) const {
+        std::size_t node = 0;
+        auto& bits = plru_bits[set_idx];
+        for (int level = 0; level < WAYS_LOG2; level++)
+            node = 2 * node + 1 + bits[node];
+        return node - (WAYS - 1);
+    }
+    void plru_mark_mru(std::size_t set_idx, std::size_t way) {
+        auto& bits = plru_bits[set_idx];
+        std::size_t node = 0;
+        for (int level = WAYS_LOG2 - 1; level >= 0; level--) {
+            unsigned dir = (way >> level) & 1u;
+            bits[node] = static_cast<uint8_t>(1u - dir);
+            node = 2 * node + 1 + dir;
+        }
+    }
 
     Policy policy_{Policy::LFSR}; // default matches CVA6 RTL
 
@@ -124,6 +187,7 @@ private:
     static constexpr int TAG_SHIFT   = log2c(LINE_BYTES) + log2c(SETS);
 
     std::array<std::array<Line, WAYS>, SETS> sets{};
+    std::array<std::array<uint8_t, (WAYS > 1 ? WAYS - 1 : 1)>, SETS> plru_bits{};
     uint64_t total_accesses{0};
     uint64_t total_hits{0};
 };

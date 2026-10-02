@@ -35,6 +35,8 @@ namespace riscv_tlm {
 #define SYSCALL_BASE_ADDRESS      0x60000000
 
 #define TO_HOST_ADDRESS           0x90000000
+// Benchmark result port, same address as the CVA6 co-sim's sim_halter
+#define HALTER_ADDRESS            0x90000018ULL
 // HTIF tohost address used by riscv-tests (default env/p linker script)
 // Write 1 = PASS; write (n<<1)|1 = FAIL test n
 #define HTIF_TOHOST_ADDR          0x80001000ULL

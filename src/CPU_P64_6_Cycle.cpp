@@ -58,17 +58,61 @@ CPURV64P6_Cycle::CPURV64P6_Cycle(sc_core::sc_module_name const &name,
   // MMU: initialized here so it can use the already-constructed mem_intf.
   mmu = new MMU(mem_intf, /*ptw_mem_cycles=*/2);
 
+  if (const char *ll = std::getenv("VP_LOAD_LAT")) {
+    int v = std::atoi(ll);
+    if (v >= 1 && v <= LOAD_HIT_SLOTS) {
+      load_hit_penalty = v;
+      logger->info("VP_LOAD_LAT={}: D$-hit load latency override", v);
+    }
+  }
+  load_hit_slots_active = load_hit_penalty;
+  if (const char *db = std::getenv("VP_DMISS_BLOCK")) dmiss_block = std::atoi(db);
+  if (const char *dx = std::getenv("VP_DMISS_EXTRA")) {
+    dmiss_extra = std::atoi(dx);
+    logger->info("VP_DMISS_EXTRA={}: D$ miss fill-tail override", dmiss_extra);
+  }
+  // Branch predictor rules: default = CVA6's frontend rules (cva6_predict(),
+  // docs/BUGS.md §B13); VP_BP=legacy restores the original VP predictor.
+  if (const char *bp = std::getenv("VP_BP")) {
+    bp_cva6 = (std::string(bp) != "legacy");
+    if (!bp_cva6) logger->info("VP_BP=legacy: original VP predictor (non-default)");
+  }
+
   // Cache replacement policy: LFSR (CVA6-accurate) by default. Set
-  // VP_CACHE_POLICY=LRU to switch both L1 caches to LRU for side-by-side
-  // comparison only -- LRU is NOT an RTL-accurate mode (real CVA6 always
-  // uses LFSR). See inc/Cache.h for why a fair LRU-vs-LFSR comparison needs
-  // workloads with genuine temporal locality, not just large sequential
-  // scans (which are LRU's textbook worst case).
-  if (const char *pol = std::getenv("VP_CACHE_POLICY")) {
-    if (std::string(pol) == "LRU") {
-      icache.set_policy(decltype(icache)::Policy::LRU);
-      dcache.set_policy(decltype(dcache)::Policy::LRU);
-      logger->info("VP_CACHE_POLICY=LRU: both L1 caches set to LRU (non-RTL-accurate, comparison mode)");
+  // VP_CACHE_POLICY=LRU|MRU|PLRU|NRU|LFU to switch both L1 caches for
+  // side-by-side comparison only -- none of these are a second
+  // RTL-accurate mode (real CVA6 always uses LFSR). See inc/Cache.h for
+  // why a fair LRU-vs-LFSR comparison needs workloads with genuine
+  // temporal locality, not just large sequential scans (which are LRU's
+  // textbook worst case).
+  // VP_ICACHE_POLICY / VP_DCACHE_POLICY override VP_CACHE_POLICY for one
+  // cache only, so I$ and D$ policy can be swept independently (e.g. pin
+  // D$ at LFSR while sweeping I$, to isolate the I$-only effect instead of
+  // changing both caches at once).
+  {
+    // icache/dcache are different Cache<> template instantiations (4-way
+    // vs 8-way), so each has its OWN distinct Policy enum type even though
+    // the enumerators are named identically -- resolve each cache's
+    // policy independently rather than sharing one enum value.
+    auto policy_for = [&](auto &cache, const std::string &name) {
+      using Pol = typename std::decay_t<decltype(cache)>::Policy;
+      if (name == "LRU") { cache.set_policy(Pol::LRU); return true; }
+      if (name == "MRU") { cache.set_policy(Pol::MRU); return true; }
+      if (name == "PLRU") { cache.set_policy(Pol::PLRU); return true; }
+      if (name == "NRU") { cache.set_policy(Pol::NRU); return true; }
+      if (name == "LFU") { cache.set_policy(Pol::LFU); return true; }
+      return false;
+    };
+    const char *shared = std::getenv("VP_CACHE_POLICY");
+    const char *ipol = std::getenv("VP_ICACHE_POLICY");
+    const char *dpol = std::getenv("VP_DCACHE_POLICY");
+    if (!ipol) ipol = shared;
+    if (!dpol) dpol = shared;
+    if (ipol && policy_for(icache, ipol)) {
+      logger->info("I$ cache policy set to {} (non-RTL-accurate, comparison mode)", ipol);
+    }
+    if (dpol && policy_for(dcache, dpol)) {
+      logger->info("D$ cache policy set to {} (non-RTL-accurate, comparison mode)", dpol);
     }
   }
 
@@ -99,6 +143,16 @@ CPURV64P6_Cycle::CPURV64P6_Cycle(sc_core::sc_module_name const &name,
     }
   }
 
+  // Same idea, I$ side -- see trace_icache_access() in CPU_P64_6_Cycle.h.
+  if (const char *itrace_path = std::getenv("VP_ICACHE_TRACE")) {
+    icache_trace_file = std::fopen(itrace_path, "w");
+    if (icache_trace_file) {
+      logger->info("VP_ICACHE_TRACE={}: dumping every I$ fetch PC for offline replay", itrace_path);
+    } else {
+      logger->error("VP_ICACHE_TRACE={}: failed to open for writing", itrace_path);
+    }
+  }
+
   // Start the main simulation thread
   SC_THREAD(cycle_thread);
 
@@ -126,21 +180,31 @@ void CPURV64P6_Cycle::set_clock(sc_core::sc_clock *c) {
   // Build the AXI contention subsystem now that the clock exists. Elaboration
   // happens here (before sc_start), which is legal during module setup.
   if (clk && !axi_top) {
-    // Burst length is derived from the AXI data width the arbiter/slave were
-    // actually built at (riscv_axi::AxiCfg, see AxiConfigSelect.h): 16B line /
-    // (dataWidth/8) bytes-per-beat. Default 64-bit build -> 2 beats (matches
+    // Burst length is derived from EACH cache's own configured line width /
+    // the AXI data width the arbiter/slave were actually built at
+    // (riscv_axi::AxiCfg, see AxiConfigSelect.h): line bytes / (dataWidth/8)
+    // bytes-per-beat. Default 16B line, 64-bit build -> 2 beats (matches
     // CVA6's real AXI width, verified against wt_axi_adapter.sv's own formula).
-    // TIMING_MODEL=CYCLE6_AXI128 build -> 1 beat (genuinely 128-bit wide, not
-    // an approximation). VP_AXI_BEATS still overrides either build's default
-    // for further side-by-side experiments -- see AxiRefillMaster.h.
-    int burst_beats = 16 / (riscv_axi::AxiCfg::dataWidth / 8);
-    if (burst_beats < 1) burst_beats = 1;
+    // I$ and D$ get independent beat counts (icache/dcache each have their
+    // own AxiRefillMaster instance, see AxiContentionTop.cpp) -- previously
+    // this used a single hardcoded-16B-line formula shared by both, which
+    // silently under-counted refill cost whenever either cache's line width
+    // was swept away from 16B (see docs/BUGS.md).
+    // TIMING_MODEL=CYCLE6_AXI128 build -> 1 beat at the 16B baseline
+    // (genuinely 128-bit wide, not an approximation). VP_AXI_BEATS still
+    // overrides BOTH caches' default for further side-by-side experiments.
+    int icache_burst_beats = static_cast<int>(decltype(icache)::LineBytes / (riscv_axi::AxiCfg::dataWidth / 8));
+    int dcache_burst_beats = static_cast<int>(decltype(dcache)::LineBytes / (riscv_axi::AxiCfg::dataWidth / 8));
+    if (icache_burst_beats < 1) icache_burst_beats = 1;
+    if (dcache_burst_beats < 1) dcache_burst_beats = 1;
     if (const char *beats = std::getenv("VP_AXI_BEATS")) {
-      burst_beats = std::atoi(beats);
-      if (burst_beats < 1) burst_beats = 1;
-      logger->info("VP_AXI_BEATS={}: AXI refill burst length overridden (non-RTL-accurate unless ={})", burst_beats, 16 / (riscv_axi::AxiCfg::dataWidth / 8));
+      int b = std::atoi(beats);
+      if (b < 1) b = 1;
+      logger->info("VP_AXI_BEATS={}: AXI refill burst length overridden for both caches (non-RTL-accurate unless it matches each cache's own line-derived beats)", b);
+      icache_burst_beats = b;
+      dcache_burst_beats = b;
     }
-    axi_top = new riscv_axi::AxiContentionTop(clk, axi_slave_latency, burst_beats);
+    axi_top = new riscv_axi::AxiContentionTop(clk, axi_slave_latency, icache_burst_beats, dcache_burst_beats);
   }
 #endif
 }
@@ -298,6 +362,13 @@ void CPURV64P6_Cycle::cycle_thread() {
     // Must be captured before PCGen_stage() clears it so the trace records
     // correctly.
     bool this_cycle_flush = flush_pipeline;
+    // Same idea for the redirect bubble (§B6 fix): PCGen_stage() consumes and
+    // clears taken_redirect_bubble this cycle, so capture it first. A flush
+    // drains the whole pipeline (fetch_queue, fetch/id/issue latches), so the
+    // bubble cycle that follows it looks pipeline-empty to the termination
+    // check below -- without this, that check fires a false "simulation
+    // done" the cycle after almost any flush.
+    bool this_cycle_bubble = taken_redirect_bubble;
 
     // 4. Issue: Dispatch instructions to execution units and allocate ROB
     // entries.
@@ -327,6 +398,39 @@ void CPURV64P6_Cycle::cycle_thread() {
     }
 
     csr.tick_counters(commit_count_this_cycle);
+
+    // Diagnostic no-progress watchdog (VP_WATCHDOG=<cycles>, default off): if no
+    // instruction retires for that many cycles, dump the pipeline state and stop.
+    {
+      static const uint64_t wd_limit = [] { const char *e = std::getenv("VP_WATCHDOG"); return e ? std::strtoull(e, nullptr, 10) : 0ULL; }();
+      static uint64_t wd_last_instr = 0, wd_last_cycle = 0;
+      if (wd_limit) {
+        if (stats.instructions != wd_last_instr) { wd_last_instr = stats.instructions; wd_last_cycle = stats.cycles; }
+        else if (stats.cycles - wd_last_cycle > wd_limit) {
+          std::cout << "[WATCHDOG] no retirement for " << wd_limit << " cycles at cycle " << stats.cycles << "\n"
+                    << std::hex << "  next_pc=" << next_pc << " pcgen_fetch_reg(v=" << pcgen_fetch_reg.valid << ",pc=" << pcgen_fetch_reg.pc
+                    << ") fetch_id(v=" << fetch_id_reg.valid << ",pc=" << fetch_id_reg.pc << ") id_issue(v=" << id_issue_reg.valid
+                    << ",pc=" << id_issue_reg.pc << ") issue_ex(v=" << issue_ex_reg.valid << ",pc=" << issue_ex_reg.pc << ")\n" << std::dec
+                    << "  stall_pcgen=" << stall_pcgen << " stall_fetch=" << stall_fetch << " stall_issue=" << stall_issue
+                    << " flush=" << flush_pipeline << " bubble=" << taken_redirect_bubble << " wfi=" << wfi_stall
+                    << " rob=" << scoreboard.get_count() << " fq=" << fetch_queue.size()
+                    << " icache_miss_rem=" << icache_miss_remaining
+#ifdef ENABLE_AXI_CONTENTION
+                    << " icache_axi_pending=" << icache_axi_pending
+#endif
+                    << "\n" << std::hex << "  rob head: pc=" << scoreboard.get_head().pc << " fu=" << std::dec << (int)scoreboard.get_head().fu
+                    << " ready=" << scoreboard.get_head().ready << " rd=" << (int)scoreboard.get_head().rd << " idx=" << scoreboard.get_head_index()
+                    << " | busy: mul=" << mul_fu.busy << " div=" << div_fu.busy << " dmiss=" << dcache_miss_fu_any_busy()
+                    << " lhit=" << load_hit_any_busy() << " fpu=" << fpu_any_busy() << " csrw=" << pending_csr_write.valid
+                    << " store_drain=" << store_drain_remaining
+                    << "\n" << std::hex << "  mip=" << csr.mip << " mstatus=" << csr.mstatus << " mcause=" << csr.mcause
+                    << " scause=" << csr.scause << " sepc=" << csr.sepc << " satp=" << csr.satp << std::dec << std::endl;
+          printStats();
+          sc_core::sc_stop();
+          break;
+        }
+      }
+    }
 
 
 
@@ -367,7 +471,7 @@ void CPURV64P6_Cycle::cycle_thread() {
     // allow the pipeline to fill up initially. During a pipeline flush/redirect
     // or while in WFI stall waiting for interrupts, the pipeline may be
     // temporarily empty but we must NOT terminate the simulation.
-    if (stats.cycles > 100 && !this_cycle_flush && !wfi_stall &&
+    if (stats.cycles > 100 && !this_cycle_flush && !this_cycle_bubble && !wfi_stall &&
         !pcgen_fetch_reg.valid &&
         !pcgen_fetch_next
              .valid && // Ensure no new instruction is being generated
@@ -401,7 +505,19 @@ void CPURV64P6_Cycle::PCGen_stage() {
     flush_pipeline = false;
     pc_redirect_valid = false;
     trap_pending = false; // Trap redirect consumed
-    taken_redirect_bubble = false; // flush supersedes any pending redirect bubble
+    // §B6 fix: a flush/misprediction redirect costs the same 1-cycle frontend
+    // steering bubble as a correctly-predicted taken branch (§B2's
+    // taken_redirect_bubble). Previously only charged on the predict-taken
+    // path, never here -- undercounted CVA6's real mispredict-recovery cost
+    // by exactly 1 cycle per mispredict (measured: 0.998 cyc/mispredict on
+    // robust_stress, see docs/BUGS.md §B6). Setting true (not false) both
+    // supersedes any stale pending bubble from before the flush AND charges
+    // the new one for this redirect.
+    // Only genuine branch/jump mispredicts pay the bubble; traps, interrupts
+    // and faults share flush_pipeline but were never validated against RTL.
+    { static const bool no_b6 = std::getenv("VP_NO_B6_BUBBLE") != nullptr;  // diagnostic A/B
+      taken_redirect_bubble = flush_is_branch_mispredict && !no_b6; }
+    flush_is_branch_mispredict = false;
     pcgen_fetch_next.valid = false;
     
     // Decoupled frontend: flush instruction fetch queue and pipeline stages
@@ -457,7 +573,7 @@ void CPURV64P6_Cycle::PCGen_stage() {
   bool predict_taken = false;
   uint64_t pt_target = 0;
 
-  if (btb[btb_idx].valid && btb[btb_idx].tag == current_pc) {
+  if (!bp_cva6 && btb[btb_idx].valid && btb[btb_idx].tag == current_pc) {
     if (btb[btb_idx].is_return) {
       // RAS Prediction
       if (!ras.empty()) {
@@ -556,6 +672,17 @@ void CPURV64P6_Cycle::Fetch_stage() {
   {
     auto tr = mmu->translate(current_pc, csr, MMU::FETCH);
     if (tr.fault) {
+      // A fetch fault is only architectural if this fetch is on the committed
+      // path. CVA6 carries the fault down the pipeline and drops it if an older
+      // branch mispredicted; here it is taken at Fetch, so hold until every
+      // older instruction has resolved (front end drained). Without this a
+      // wrong-path fetch to a garbage BTB/RAS target (CVA6's BTB is tagless)
+      // raises a real trap and corrupts CSR state.
+      if (!fetch_fault_nonspeculative()) {
+        stall_pcgen = true;
+        fetch_id_next.valid = false;
+        return;
+      }
       // Instruction page fault — redirect to trap handler.
       // tval = faulting virtual address (current_pc) per RISC-V spec.
       uint64_t tvec =
@@ -577,6 +704,11 @@ void CPURV64P6_Cycle::Fetch_stage() {
     }
     fetch_pa = tr.paddr;
     if (!csr.pmp_check(fetch_pa, 4, false, true)) {
+      if (!fetch_fault_nonspeculative()) {
+        stall_pcgen = true;
+        fetch_id_next.valid = false;
+        return;
+      }
       uint64_t tvec =
           csr.take_exception(CAUSE::INSTR_ACCESS, current_pc, current_pc);
       pc_redirect_target = tvec;
@@ -595,6 +727,7 @@ void CPURV64P6_Cycle::Fetch_stage() {
   }
 
   // --- I$ hit/miss check ---
+  trace_icache_access(current_pc);
   if (!icache.access(current_pc)) { // I$ indexed by VA (VIPT)
     stats.icache_misses++;
 #ifdef ENABLE_AXI_CONTENTION
@@ -620,8 +753,124 @@ void CPURV64P6_Cycle::Fetch_stage() {
   fetch_id_next.predicted_taken = pcgen_fetch_reg.predicted_taken;
   fetch_id_next.predicted_target = pcgen_fetch_reg.predicted_target;
 
+  if (bp_cva6) {
+    // CVA6 scans the instruction as it leaves the I$ and redirects PCGen.
+    // Stages run Fetch before PCGen, so the redirect lands this cycle; the
+    // taken-redirect bubble (§B2) keeps the same timing as the old path.
+    uint64_t tgt = 0;
+    bool taken = cva6_predict(current_pc, instr, is_c, tgt);
+    fetch_id_next.predicted_taken = taken;
+    fetch_id_next.predicted_target = taken ? tgt : 0;
+    if (taken) {
+      next_pc = tgt;
+      taken_redirect_bubble = true;
+    } else if (is_c) {
+      next_pc -= 2;
+    }
+    return;
+  }
+
   if (is_c && !pcgen_fetch_reg.predicted_taken)
     next_pc -= 2;
+}
+
+bool CPURV64P6_Cycle::cva6_is_return(uint32_t instr, bool is_c) {
+  if (!is_c) {
+    uint32_t rd = (instr >> 7) & 31, rs1 = (instr >> 15) & 31;
+    return (instr & 0x7F) == 0x67 && (rs1 == 1 || rs1 == 5) && rs1 != rd;
+  }
+  uint32_t rs1 = (instr >> 7) & 31;
+  bool c_jr = (instr & 3) == 2 && ((instr >> 13) & 7) == 4 &&
+              ((instr >> 2) & 31) == 0 && !((instr >> 12) & 1);
+  return c_jr && (rs1 == 1 || rs1 == 5);
+}
+
+// CVA6 frontend.sv + instr_scan.sv prediction for one fetched instruction.
+bool CPURV64P6_Cycle::cva6_predict(uint64_t pc, uint32_t instr, bool is_c,
+                                   uint64_t &target) {
+  auto sext = [](uint64_t v, int bits) {
+    return static_cast<int64_t>(v << (64 - bits)) >> (64 - bits);
+  };
+  bool branch = false, jump = false, jalr = false, call = false;
+  bool ret = cva6_is_return(instr, is_c);
+  int64_t imm = 0;
+  if (!is_c) {
+    uint32_t op = instr & 0x7F, rd = (instr >> 7) & 31;
+    if (op == 0x63) {
+      branch = true;
+      imm = sext((((instr >> 31) & 1) << 12) | (((instr >> 7) & 1) << 11) |
+                 (((instr >> 25) & 0x3F) << 5) | (((instr >> 8) & 0xF) << 1), 13);
+    } else if (op == 0x6F) {
+      jump = true;
+      imm = sext((((instr >> 31) & 1) << 20) | (((instr >> 12) & 0xFF) << 12) |
+                 (((instr >> 20) & 1) << 11) | (((instr >> 21) & 0x3FF) << 1), 21);
+    } else if (op == 0x67) {
+      jalr = !ret;
+    }
+    call = (op == 0x6F || op == 0x67) && (rd == 1 || rd == 5);
+  } else {
+    uint32_t q = instr & 3, f3 = (instr >> 13) & 7;
+    if (q == 1 && f3 == 5) {                       // c.j
+      jump = true;
+      imm = sext((((instr >> 12) & 1) << 11) | (((instr >> 8) & 1) << 10) |
+                 (((instr >> 9) & 3) << 8) | (((instr >> 6) & 1) << 7) |
+                 (((instr >> 7) & 1) << 6) | (((instr >> 2) & 1) << 5) |
+                 (((instr >> 11) & 1) << 4) | (((instr >> 3) & 7) << 1), 12);
+    } else if (q == 1 && (f3 == 6 || f3 == 7)) {   // c.beqz / c.bnez
+      branch = true;
+      imm = sext((((instr >> 12) & 1) << 8) | (((instr >> 5) & 3) << 6) |
+                 (((instr >> 2) & 1) << 5) | (((instr >> 10) & 3) << 3) |
+                 (((instr >> 3) & 3) << 1), 9);
+    } else if (q == 2 && f3 == 4 && ((instr >> 2) & 31) == 0) {
+      if ((instr >> 12) & 1) { jalr = true; call = true; }  // c.jalr
+      else if (!ret) jalr = true;                           // c.jr (not ra)
+    }
+  }
+
+  bool taken = false;
+  if (branch) {
+    const auto &e = c6_bht[(pc >> 1) % 128];
+    taken = e.valid ? ((e.ctr >> 1) & 1) : (imm < 0);
+    if (taken) target = pc + imm;
+  } else if (jump) {
+    taken = true;
+    target = pc + imm;
+  } else if (ret) {
+    if (c6_ras[0].valid) { taken = true; target = c6_ras[0].ra; }
+  } else if (jalr) {
+    const auto &b = c6_btb[(pc >> 1) % 32];
+    if (b.valid) { taken = true; target = b.target; }
+  }
+
+  {
+    // Debug: VP_BP_MASK bit0 cond, bit1 jal, bit2 return, bit3 jalr -> never predict that kind taken.
+    static const int mask = [] { const char *e = std::getenv("VP_BP_MASK"); return e ? std::atoi(e) : 0; }();
+    if (mask && taken && ((branch && (mask & 1)) || (jump && (mask & 2)) || (ret && (mask & 4)) || (jalr && (mask & 8))))
+      taken = false;
+  }
+
+  // RAS update at prediction time (ras.sv): pop on a predicted return,
+  // push the link address on a call; both at once replaces the top.
+  bool pop = ret && c6_ras[0].valid;
+  uint64_t link = pc + (is_c ? 2 : 4);
+  if (pop && call) {
+    c6_ras[0] = {true, link};
+  } else if (call) {
+    c6_ras[1] = c6_ras[0];
+    c6_ras[0] = {true, link};
+  } else if (pop) {
+    c6_ras[0] = c6_ras[1];
+    c6_ras[1] = {false, 0};
+  }
+  return taken;
+}
+
+// True when no older instruction can still redirect the front end: every stage
+// between Fetch and Commit-bound execution is empty, so a fetch fault here is on
+// the architectural path.
+bool CPURV64P6_Cycle::fetch_fault_nonspeculative() const {
+  return fetch_queue.empty() && !fetch_id_reg.valid && !id_issue_reg.valid &&
+         !id_issue_next.valid && !issue_ex_reg.valid && !issue_ex_next.valid;
 }
 
 bool CPURV64P6_Cycle::fetch_instruction(uint64_t addr, uint32_t &data) {
@@ -1079,13 +1328,19 @@ void CPURV64P6_Cycle::ID_stage() {
     bool is_branch_instr =
         (id_issue_next.opcode == 0x63 || id_issue_next.opcode == 0x6F ||
          id_issue_next.opcode == 0x67);
-    if (!is_branch_instr && fetch_id_reg.predicted_taken) {
+    // CVA6 has no decode-stage check of the prediction (is_ctrl_flow_i is unused in
+    // issue_stage.sv). Under VP_BP=cva6 a mis-scanned non-branch (c.ebreak looks like
+    // c.jalr) flows on and the older branch's EX resolution flushes the wrong path;
+    // flushing here would also wipe the older instruction Issue just dispatched.
+    if (!bp_cva6 && !is_branch_instr && fetch_id_reg.predicted_taken) {
       pc_redirect_target =
           fetch_id_reg.pc + 2; // Compressed instructions are always 2 bytes
       pc_redirect_valid = true;
       flush_pipeline = true;
+      flush_is_branch_mispredict = true;
       stats.flushes++;
       stats.branch_mispredicts++;
+      stats.mp_alias++;
     }
     return;
   }
@@ -1183,12 +1438,14 @@ void CPURV64P6_Cycle::ID_stage() {
   bool is_branch_instr =
       (id_issue_next.opcode == 0x63 || id_issue_next.opcode == 0x6F ||
        id_issue_next.opcode == 0x67);
-  if (!is_branch_instr && fetch_id_reg.predicted_taken) {
-    pc_redirect_target = fetch_id_reg.pc + (fetch_id_reg.is_compressed ? 2 : 4);
+  if (!bp_cva6 && !is_branch_instr && fetch_id_reg.predicted_taken) {
+        pc_redirect_target = fetch_id_reg.pc + (fetch_id_reg.is_compressed ? 2 : 4);
     pc_redirect_valid = true;
     flush_pipeline = true;
+    flush_is_branch_mispredict = true;
     stats.flushes++;
     stats.branch_mispredicts++;
+    stats.mp_alias++;
   }
 }
 
@@ -1382,7 +1639,14 @@ void CPURV64P6_Cycle::Issue_stage() {
   // If the producer instruction currently in EX is a shift instruction, and the
   // consumer in Issue stage reads the register written by it, we force a 1-cycle stall
   // UNLESS the consumer is a fast logical instruction (AND/OR/XOR) which can be bypassed.
-  if (issue_ex_reg.valid) {
+  // Superseded by the WAW rule below (tests/fpmb: a shift feeding a *different*
+  // rd is free in RTL; the old shift-only rule was a WAW artifact). Opt-in
+  // (VP_WAW_BUBBLE=1 EX-stage approx, =2 faithful rd_clobber rule) because
+  // it regresses long_test3 (+9%) and div_stress — see docs/BUGS.md §B12.
+  static const int waw_mode = [] { const char *e = std::getenv("VP_WAW_BUBBLE"); return e ? std::atoi(e) : 1; }();
+  const bool waw_bubble = (waw_mode == 1);      // EX-stage approximation
+  const bool waw_clobber = (waw_mode == 2);     // faithful: rd_clobber still busy
+  if (waw_mode == 0 && issue_ex_reg.valid) {
     uint32_t ex_opcode = issue_ex_reg.instr & 0x7F;
     uint32_t ex_funct3 = (issue_ex_reg.instr >> 12) & 0x7;
     bool ex_is_shift = false;
@@ -1407,6 +1671,35 @@ void CPURV64P6_Cycle::Issue_stage() {
         }
       }
     }
+  }
+
+  // Same-destination back-to-back integer ALU ops (WAW at distance 1) cost +1
+  // cycle in CVA6 whether or not the second reads the first's result
+  // (tests/fpmb: add a0,..; add a0,.. runs at 2 cyc/op). WAW at distance 2,
+  // WAR, and RAW into a *different* rd are free. Opt-in: VP_WAW_BUBBLE=1.
+  {
+    auto is_int_alu = [](uint32_t op) { return op == 0x33 || op == 0x3B || op == 0x13 || op == 0x1B; };
+    // mul (funct3<4) counts as a producer (mul->add same rd = 3 cyc/op in RTL);
+    // div/rem (funct3>=4) occupy EX for many cycles and are excluded.
+    if (waw_bubble && issue_ex_reg.valid && is_int_alu(issue_ex_reg.instr & 0x7F) &&
+        !(((issue_ex_reg.instr >> 25) & 0x7F) == 1 && ((issue_ex_reg.instr >> 12) & 0x7) >= 4) &&
+        is_int_alu(id_issue_reg.opcode) && id_issue_reg.rd != 0 &&
+        issue_ex_reg.rd == id_issue_reg.rd) {
+      need_stall = true;
+    }
+    // multiply (2-cycle) -> same-rd ALU op: +1 after the multiply completes
+    if (waw_bubble && mul_waw_rd > 0 && is_int_alu(id_issue_reg.opcode) &&
+        id_issue_reg.rd == mul_waw_rd) {
+      need_stall = true;
+    }
+  }
+
+  // CVA6 issue_read_operands.sv gen_check_waw_dependencies: stall while ANY
+  // in-flight (uncommitted) scoreboard entry writes the same rd; released when
+  // commit writes it (commit runs before issue here, so clobber is already clear).
+  if (waw_clobber && writes_to_int_reg && id_issue_reg.rd != 0 &&
+      scoreboard.rd_clobber[id_issue_reg.rd].busy) {
+    need_stall = true;
   }
 
   // CSR RAW hazard: if previous instruction wrote a CSR that this one reads
@@ -1492,7 +1785,7 @@ void CPURV64P6_Cycle::Issue_stage() {
       (id_issue_reg.opcode == 0x07 && dcache_miss_fu_full()) ||
       (fu == FunctionalUnit::LSU &&
        (id_issue_reg.opcode == 0x03 || id_issue_reg.opcode == 0x2F) &&
-       (dcache_miss_fu_full() || load_hit_fu.busy))) {
+       (dcache_miss_fu_full() || load_hit_full()))) {
     stall_issue = true;
     issue_ex_next.valid = false;
     stats.stalls++;
@@ -1538,7 +1831,7 @@ void CPURV64P6_Cycle::Issue_stage() {
   if (id_issue_reg.opcode == 0x73) {
     bool multi_cycle_in_flight =
         dcache_miss_fu_any_busy() || mul_fu.busy || div_fu.busy || fpu_any_busy() ||
-        load_hit_fu.busy;
+        load_hit_any_busy() || dmiss_tail_any_busy();
     if (multi_cycle_in_flight) {
       stall_issue = true;
       issue_ex_next.valid = false;
@@ -1598,12 +1891,14 @@ void CPURV64P6_Cycle::Issue_stage() {
     store_buffer.flush_speculative();
     for (int i = 0; i < dcache_miss_slots_active; i++) {
 #ifdef ENABLE_AXI_CONTENTION
-      if (dcache_miss_fu[i].busy) axi_top->ack(riscv_axi::AxiContentionTop::DCACHE);
+      if (dcache_miss_fu[i].busy && dcache_miss_fu[i].trans_id != DMISS_HOLD) axi_top->ack(riscv_axi::AxiContentionTop::DCACHE);
 #endif
       dcache_miss_fu[i].busy = false;
     }
-    mul_fu.busy = div_fu.busy =
-        load_hit_fu.busy = false;
+    mul_fu.busy = div_fu.busy = false;
+    for (auto &lh : load_hit_pipe) lh.busy = false;
+  for (auto &dt : dmiss_tail) dt.busy = false;
+    for (auto &dt : dmiss_tail) dt.busy = false;
     for (int fs = 0; fs < FPU_SLOTS; fs++) fpu_pipe[fs].busy = false;
   fpu_divsqrt_fu.busy = false;
     uint64_t tvec = csr.take_exception(CAUSE::ILLEGAL_INSTR, id_issue_reg.pc,
@@ -1656,10 +1951,12 @@ void CPURV64P6_Cycle::EX_stage() {
   // --- Tick multi-cycle functional units (runs every cycle regardless of
   // issue_ex_reg) --- Each FU operates independently; the scoreboard handles
   // data-dependent stalls.
+  mul_waw_rd = -1;
   if (mul_fu.busy) {
     stats.mul_stall_cycles++;
     if (--mul_fu.remaining == 0) {
       scoreboard.complete(mul_fu.trans_id, mul_fu.result, mul_fu.rd);
+      mul_waw_rd = mul_fu.rd;
       mul_fu.busy = false;
     }
   }
@@ -1677,6 +1974,10 @@ void CPURV64P6_Cycle::EX_stage() {
     // TEMP DIAGNOSTIC: does an I$ miss and D$ miss ever actually overlap?
     if (dms == 0 && icache_miss_remaining > 0) diag_costall_cycles++;
 #ifdef ENABLE_AXI_CONTENTION
+    if (dmf.trans_id == DMISS_HOLD) { // fill still occupying the miss path
+      if (--dmf.remaining <= 0) dmf.busy = false;
+      continue;
+    }
     // AXI mode: the D$ refill completes when the arbiter+slave return the read
     // (may be delayed behind an I$ miss holding the shared port = contention).
     if (axi_top->done(riscv_axi::AxiContentionTop::DCACHE)) {
@@ -1696,6 +1997,25 @@ void CPURV64P6_Cycle::EX_stage() {
                       axi_result, dmf.result);
         std::abort();
       }
+      if (dmiss_extra > 0) {
+        // Line is back: the miss slot frees now (next miss can go out), but the
+        // load result is usable only after the fill tail.
+        int t = 0;
+        while (t < DMISS_TAIL_SLOTS && dmiss_tail[t].busy) t++;
+        if (t < DMISS_TAIL_SLOTS) {
+          dmiss_tail[t] = dmf;
+          dmiss_tail[t].busy = true;
+          dmiss_tail[t].remaining = dmiss_extra;
+          dmiss_tail[t].result = axi_result;
+          if (dmiss_block > 0) {
+            dmf.trans_id = DMISS_HOLD;
+            dmf.remaining = dmiss_block;
+          } else {
+            dmf.busy = false;
+          }
+          continue;
+        }
+      }
       scoreboard.complete(dmf.trans_id, axi_result, dmf.rd);
       if (dmf.rd != 0) reg_load_tainted |= (1u << dmf.rd); // §B9
       dmf.busy = false;
@@ -1708,13 +2028,21 @@ void CPURV64P6_Cycle::EX_stage() {
     }
 #endif
   }
-  if (load_hit_fu.busy) {
-    stats.load_use_stall_cycles++;
-    if (--load_hit_fu.remaining == 0) {
-      scoreboard.complete(load_hit_fu.trans_id, load_hit_fu.result,
-                          load_hit_fu.rd);
-      if (load_hit_fu.rd != 0) reg_load_tainted |= (1u << load_hit_fu.rd); // §B9
-      load_hit_fu.busy = false;
+  for (auto &dt : dmiss_tail) {
+    if (!dt.busy) continue;
+    if (--dt.remaining == 0) {
+      scoreboard.complete(dt.trans_id, dt.result, dt.rd);
+      if (dt.rd != 0) reg_load_tainted |= (1u << dt.rd); // §B9
+      dt.busy = false;
+    }
+  }
+  if (load_hit_any_busy()) stats.load_use_stall_cycles++;
+  for (auto &lh : load_hit_pipe) {
+    if (!lh.busy) continue;
+    if (--lh.remaining == 0) {
+      scoreboard.complete(lh.trans_id, lh.result, lh.rd);
+      if (lh.rd != 0) reg_load_tainted |= (1u << lh.rd); // §B9
+      lh.busy = false;
     }
   }
   // Pipelined FPU: tick every in-flight slot; each completes independently.
@@ -2306,12 +2634,13 @@ void CPURV64P6_Cycle::EX_stage() {
       }
       stats.load_store_forwards++;
       // load-use stall: configured by load_hit_penalty to represent AXI bus latency on hits.
-      if (!load_hit_fu.busy) {
-        load_hit_fu.busy = true;
-        load_hit_fu.remaining = load_hit_penalty;
-        load_hit_fu.result = fwd_result_val;
-        load_hit_fu.trans_id = issue_ex_reg.rob_index;
-        load_hit_fu.rd = issue_ex_reg.rd;
+      if (int ls = load_hit_free_slot(); ls >= 0) {
+        auto &lf = load_hit_pipe[ls];
+        lf.busy = true;
+        lf.remaining = load_hit_penalty;
+        lf.result = fwd_result_val;
+        lf.trans_id = issue_ex_reg.rob_index;
+        lf.rd = issue_ex_reg.rd;
       }
       multi_cycle_dispatched = true;
     } else {
@@ -2378,12 +2707,13 @@ void CPURV64P6_Cycle::EX_stage() {
           multi_cycle_dispatched = true;
         } else {
           // D$ hit: result available next cycle — load-use stall configured by load_hit_penalty.
-          if (!load_hit_fu.busy) {
-            load_hit_fu.busy = true;
-            load_hit_fu.remaining = load_hit_penalty;
-            load_hit_fu.result = mem_result;
-            load_hit_fu.trans_id = issue_ex_reg.rob_index;
-            load_hit_fu.rd = issue_ex_reg.rd;
+          if (int ls = load_hit_free_slot(); ls >= 0) {
+            auto &lf = load_hit_pipe[ls];
+            lf.busy = true;
+            lf.remaining = load_hit_penalty;
+            lf.result = mem_result;
+            lf.trans_id = issue_ex_reg.rob_index;
+            lf.rd = issue_ex_reg.rd;
           }
           multi_cycle_dispatched = true;
         }
@@ -2709,37 +3039,53 @@ void CPURV64P6_Cycle::EX_stage() {
         (branch_taken != issue_ex_reg.predicted_taken) ||
         (branch_taken && (branch_target != issue_ex_reg.predicted_target));
 
-    // Train Predictor
-    uint32_t btb_idx = (issue_ex_reg.pc >> 2) % 32;
-    uint32_t bht_idx = (issue_ex_reg.pc >> 2) % 128;
-
-    if (issue_ex_reg.opcode == 0x63) { // Conditional Branch
-      uint8_t current_bht = bht[bht_idx];
-      if (branch_taken) {
-        if (current_bht < 3)
-          bht[bht_idx]++;
-      } else {
-        if (current_bht > 0)
-          bht[bht_idx]--;
+    if (bp_cva6) {
+      // bht.sv: every resolved conditional branch updates its entry (valid=1,
+      // saturating). btb.sv: only a mispredicted jalr that was not predicted
+      // as a return writes its target.
+      if (issue_ex_reg.opcode == 0x63) {
+        auto &e = c6_bht[(issue_ex_reg.pc >> 1) % 128];
+        e.valid = true;
+        if (branch_taken) { if (e.ctr < 3) e.ctr++; }
+        else              { if (e.ctr > 0) e.ctr--; }
+      } else if (issue_ex_reg.opcode == 0x67 && mispredict &&
+                 !(cva6_is_return(issue_ex_reg.instr, issue_ex_reg.is_compressed) &&
+                   issue_ex_reg.predicted_taken)) {
+        c6_btb[(issue_ex_reg.pc >> 1) % 32] = {true, branch_target};
       }
-      btb[btb_idx].tag = issue_ex_reg.pc; // Tag to prevent aliasing
-      btb[btb_idx].target = branch_target;
-      btb[btb_idx].valid = true;
-      btb[btb_idx].is_return = false;
-    } else {                              // Unconditional Jump (JAL/JALR)
-      btb[btb_idx].tag = issue_ex_reg.pc; // Tag to prevent aliasing
-      btb[btb_idx].target = branch_target;
-      btb[btb_idx].valid = true;
-      bht[bht_idx] = 3; // Force Strongly Taken
+    } else {
+      // Train Predictor
+      uint32_t btb_idx = (issue_ex_reg.pc >> 2) % 32;
+      uint32_t bht_idx = (issue_ex_reg.pc >> 2) % 128;
 
-      // RAS Maintenance
-      if (issue_ex_reg.is_ras_call) {
-        ras.push_back(issue_ex_reg.pc + (issue_ex_reg.is_compressed ? 2 : 4));
-        if (ras.size() > 2)
-          ras.erase(ras.begin());
-      }
-      if (issue_ex_reg.is_ras_return) {
-        btb[btb_idx].is_return = true;
+      if (issue_ex_reg.opcode == 0x63) { // Conditional Branch
+        uint8_t current_bht = bht[bht_idx];
+        if (branch_taken) {
+          if (current_bht < 3)
+            bht[bht_idx]++;
+        } else {
+          if (current_bht > 0)
+            bht[bht_idx]--;
+        }
+        btb[btb_idx].tag = issue_ex_reg.pc; // Tag to prevent aliasing
+        btb[btb_idx].target = branch_target;
+        btb[btb_idx].valid = true;
+        btb[btb_idx].is_return = false;
+      } else {                              // Unconditional Jump (JAL/JALR)
+        btb[btb_idx].tag = issue_ex_reg.pc; // Tag to prevent aliasing
+        btb[btb_idx].target = branch_target;
+        btb[btb_idx].valid = true;
+        bht[bht_idx] = 3; // Force Strongly Taken
+
+        // RAS Maintenance
+        if (issue_ex_reg.is_ras_call) {
+          ras.push_back(issue_ex_reg.pc + (issue_ex_reg.is_compressed ? 2 : 4));
+          if (ras.size() > 2)
+            ras.erase(ras.begin());
+        }
+        if (issue_ex_reg.is_ras_return) {
+          btb[btb_idx].is_return = true;
+        }
       }
     }
 
@@ -2751,9 +3097,16 @@ void CPURV64P6_Cycle::EX_stage() {
               : (issue_ex_reg.pc + (issue_ex_reg.is_compressed ? 2 : 4));
       pc_redirect_valid = true;
       flush_pipeline = true;
+      flush_is_branch_mispredict = true;
       stats.flushes++;
       stats.branch_mispredicts++;
-      ras.clear(); // Safe recovery strategy on mispredict
+      { static FILE *mp_trace = [] { const char *p = std::getenv("VP_MP_TRACE"); return p ? std::fopen(p, "w") : nullptr; }();
+        if (mp_trace) std::fprintf(mp_trace, "%llx %d\n", (unsigned long long)issue_ex_reg.pc, branch_taken ? 1 : 0); }
+      if (issue_ex_reg.opcode == 0x63) stats.mp_cond++;
+      else if (issue_ex_reg.opcode == 0x6F) stats.mp_jal++;
+      else if (cva6_is_return(issue_ex_reg.instr, issue_ex_reg.is_compressed)) stats.mp_ret++;
+      else stats.mp_jalr++;
+      if (!bp_cva6) ras.clear(); // VP-only recovery (CVA6 never flushes its RAS)
 
       // Flush only speculative instructions younger than this branch
       scoreboard.flush_speculative(issue_ex_reg.rob_index);
@@ -2782,7 +3135,8 @@ void CPURV64P6_Cycle::EX_stage() {
         cancel_if_flushed(dcache_miss_fu[i]);
 #endif
       }
-      cancel_if_flushed(load_hit_fu);
+      for (auto &lh : load_hit_pipe) cancel_if_flushed(lh);
+      for (auto &dt : dmiss_tail) cancel_if_flushed(dt);
     }
   }
 
@@ -3311,12 +3665,14 @@ ex_done:
     store_buffer.flush_speculative();
     for (int i = 0; i < dcache_miss_slots_active; i++) {
 #ifdef ENABLE_AXI_CONTENTION
-      if (dcache_miss_fu[i].busy) axi_top->ack(riscv_axi::AxiContentionTop::DCACHE);
+      if (dcache_miss_fu[i].busy && dcache_miss_fu[i].trans_id != DMISS_HOLD) axi_top->ack(riscv_axi::AxiContentionTop::DCACHE);
 #endif
       dcache_miss_fu[i].busy = false;
     }
-    mul_fu.busy = div_fu.busy =
-        load_hit_fu.busy = false;
+    mul_fu.busy = div_fu.busy = false;
+    for (auto &lh : load_hit_pipe) lh.busy = false;
+  for (auto &dt : dmiss_tail) dt.busy = false;
+    for (auto &dt : dmiss_tail) dt.busy = false;
     for (int fs = 0; fs < FPU_SLOTS; fs++) fpu_pipe[fs].busy = false;
   fpu_divsqrt_fu.busy = false;
     multi_cycle_dispatched = true;
@@ -3464,11 +3820,13 @@ bool CPURV64P6_Cycle::cpu_process_IRQ() {
   store_buffer.flush_speculative();
   for (int i = 0; i < dcache_miss_slots_active; i++) {
 #ifdef ENABLE_AXI_CONTENTION
-    if (dcache_miss_fu[i].busy) axi_top->ack(riscv_axi::AxiContentionTop::DCACHE);
+    if (dcache_miss_fu[i].busy && dcache_miss_fu[i].trans_id != DMISS_HOLD) axi_top->ack(riscv_axi::AxiContentionTop::DCACHE);
 #endif
     dcache_miss_fu[i].busy = false;
   }
   mul_fu.busy = div_fu.busy = false;
+  for (auto &lh : load_hit_pipe) lh.busy = false;
+  for (auto &dt : dmiss_tail) dt.busy = false;
   for (int fs = 0; fs < FPU_SLOTS; fs++) fpu_pipe[fs].busy = false;
   fpu_divsqrt_fu.busy = false;
   stall_ex = false; // Cancel any pending EX replay
@@ -3578,6 +3936,9 @@ void CPURV64P6_Cycle::printStats() const {
   std::cout << "  Flushes:      " << stats.flushes << "\n";
   std::cout << "  Branches:     " << stats.branches << "\n";
   std::cout << "  Mispredicts:  " << stats.branch_mispredicts << "\n";
+  std::cout << "    by kind:    cond " << stats.mp_cond << ", jal " << stats.mp_jal
+            << ", ret " << stats.mp_ret << ", jalr " << stats.mp_jalr
+            << ", BTB-alias " << stats.mp_alias << "\n";
   if (stats.branches > 0) {
     std::cout << "  Predict Rate: " << std::fixed << std::setprecision(1)
               << (100.0 * (stats.branches - stats.branch_mispredicts) /

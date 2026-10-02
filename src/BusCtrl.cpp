@@ -43,6 +43,24 @@ namespace riscv_tlm {
         sc_dt::uint64 adr = adr_bytes / 4;
 
 
+        // Benchmark result port (0x90000018), mirrors the CVA6 co-sim's
+        // sim_halter: bare-metal benchmarks write their own counter readings
+        // here so VP and RTL report the same measured region. Print-only.
+        if (adr_bytes == HALTER_ADDRESS && trans.get_command() == tlm::TLM_WRITE_COMMAND) {
+            static unsigned halter_writes = 0;
+            uint64_t val = 0;
+            uint32_t len = trans.get_data_length();
+            memcpy(&val, trans.get_data_ptr(), (len < 8) ? len : 8);
+            if (val == 0xE000000CULL) {
+                std::cout << "[HALTER] stop\n" << std::flush;
+                halter_writes = 0;
+            } else {
+                std::cout << "[HALTER] " << halter_writes++ << ": " << val << "\n" << std::flush;
+            }
+            trans.set_response_status(tlm::TLM_OK_RESPONSE);
+            return;
+        }
+
         // Legacy TO_HOST (0x90000000) — exact address match for RISC-V tests
         if (adr_bytes == TO_HOST_ADDRESS) {
             uint64_t val = 0;

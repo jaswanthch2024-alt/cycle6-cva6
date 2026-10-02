@@ -42,7 +42,8 @@ struct AxiContentionTop::Impl : public sc_module {
   local_axi::write::chan<>  ws;   // arbiter <-> slave (write)
 
   SC_HAS_PROCESS(Impl);
-  Impl(sc_module_name nm, sc_core::sc_clock* clk, int slave_latency, int burst_beats)
+  Impl(sc_module_name nm, sc_core::sc_clock* clk, int slave_latency,
+       int icache_burst_beats, int dcache_burst_beats)
       : sc_module(nm), clk_(clk), rst_bar("rst_bar"), rs("rs"), ws("ws") {
 
     arbiter = new AxiArbiter<riscv_axi::AxiCfg, NM, 4>("arbiter");
@@ -63,7 +64,12 @@ struct AxiContentionTop::Impl : public sc_module {
 
       rch[i] = new local_axi::read::chan<>(sc_gen_unique_name("rch"));
       wch[i] = new local_axi::write::chan<>(sc_gen_unique_name("wch"));
-      master[i] = new AxiRefillMaster(sc_gen_unique_name("axi_master"), burst_beats);
+      // Each master gets its own beat count: I$ (index ICACHE) uses the I$
+      // line width, D$ and STORE (which writes D$-sized lines) use the D$
+      // line width -- independent AxiRefillMaster instances, so this is
+      // genuinely per-cache, not a shared/contaminated value.
+      int beats_for_master = (i == ICACHE) ? icache_burst_beats : dcache_burst_beats;
+      master[i] = new AxiRefillMaster(sc_gen_unique_name("axi_master"), beats_for_master);
       master[i]->clk(*clk_);
       master[i]->rst_bar(rst_bar);
 
@@ -103,8 +109,9 @@ struct AxiContentionTop::Impl : public sc_module {
 
 // ---- PIMPL forwarding -------------------------------------------------------
 
-AxiContentionTop::AxiContentionTop(sc_core::sc_clock* clk, int slave_latency, int burst_beats)
-    : impl_(new Impl("axi_contention", clk, slave_latency, burst_beats)) {}
+AxiContentionTop::AxiContentionTop(sc_core::sc_clock* clk, int slave_latency,
+                                    int icache_burst_beats, int dcache_burst_beats)
+    : impl_(new Impl("axi_contention", clk, slave_latency, icache_burst_beats, dcache_burst_beats)) {}
 
 AxiContentionTop::~AxiContentionTop() { /* impl_ owned by SystemC hierarchy */ }
 

@@ -240,6 +240,20 @@ int main() {
         {"line", BASE_SETS, BASE_WAYS, 512},   // 1MB
         {"line", BASE_SETS, BASE_WAYS,1024},   // 2MB -- same footprint-equal point as sets/ways
         {"line", BASE_SETS, BASE_WAYS,2048},   // 4MB -- past the footprint, confirm/find plateau
+
+        // sets+ways together: both dimensions double each step (line held
+        // at baseline), so total capacity grows 4x per step instead of 2x
+        // as in the single-dimension "sets" and "ways" sweeps above, and
+        // the sets:ways RATIO (32:1) stays constant throughout -- isolates
+        // "does joint capacity growth behave differently from growing
+        // either dimension alone."
+        {"sets_ways",   64,   2, BASE_LINE},    // 2KB
+        {"sets_ways",  128,   4, BASE_LINE},    // 8KB
+        {"sets_ways",  256,   8, BASE_LINE},    // 32KB -- same point as "baseline" above
+        {"sets_ways",  512,  16, BASE_LINE},    // 128KB
+        {"sets_ways", 1024,  32, BASE_LINE},    // 512KB
+        {"sets_ways", 2048,  64, BASE_LINE},    // 2MB -- footprint-equal point
+        {"sets_ways", 4096, 128, BASE_LINE},    // 8MB -- past the footprint, confirm plateau
     };
 
     std::printf("%-10s %6s %5s %6s %10s | %9s %9s %8s | %9s\n",
@@ -264,16 +278,17 @@ int main() {
             seq_pct, strd_pct, strd_pct - seq_pct, c2.hit_rate() * 100.0);
     }
 
-    // ---- Policy comparison: LFSR vs LRU vs MRU vs OPT (the ceiling) -------
+    // ---- Policy comparison: LFSR/LRU/MRU/PLRU/NRU/LFU vs OPT (the ceiling) -
     // Separate table on purpose -- this is a different question (which
     // eviction policy, not which geometry) and doesn't belong crammed into
     // the geometry table's columns. OPT is not a real/implementable policy;
     // it's the theoretical best any policy could achieve, included to show
-    // how much headroom LFSR/LRU/MRU are each leaving on the table.
-    std::printf("\n\nPolicy comparison (LFSR vs LRU vs MRU vs Belady's OPT ceiling)\n");
-    std::printf("%-10s %6s %5s %6s | %9s %9s %9s %9s\n",
-                "dim", "sets", "ways", "line", "LFSR%", "LRU%", "MRU%", "OPT%");
-    std::printf("%s\n", std::string(80, '-').c_str());
+    // how much headroom the six real policies are each leaving on the table.
+    std::printf("\n\nPolicy comparison (LFSR/LRU/MRU/PLRU/NRU/LFU vs Belady's OPT ceiling)\n");
+    std::printf("%-10s %6s %5s %6s | %8s %8s %8s %8s %8s %8s | %8s\n",
+                "dim", "sets", "ways", "line",
+                "LFSR%", "LRU%", "MRU%", "PLRU%", "NRU%", "LFU%", "OPT%");
+    std::printf("%s\n", std::string(104, '-').c_str());
 
     std::vector<Config> policy_configs = {
         {"baseline", BASE_SETS, BASE_WAYS, BASE_LINE},
@@ -284,26 +299,26 @@ int main() {
                               std::make_pair("strided", &strided_trace) }) {
         std::printf("\n-- %s trace --\n", trace_pair.first);
         for (auto &cfg : policy_configs) {
-            RuntimeCache c_lfsr(cfg.sets, cfg.ways, cfg.line);
-            c_lfsr.set_policy(RuntimeCache::Policy::LFSR);
-            run_real_trace(c_lfsr, *trace_pair.second);
-
-            RuntimeCache c_lru(cfg.sets, cfg.ways, cfg.line);
-            c_lru.set_policy(RuntimeCache::Policy::LRU);
-            run_real_trace(c_lru, *trace_pair.second);
-
-            RuntimeCache c_mru(cfg.sets, cfg.ways, cfg.line);
-            c_mru.set_policy(RuntimeCache::Policy::MRU);
-            run_real_trace(c_mru, *trace_pair.second);
+            auto run_policy = [&](RuntimeCache::Policy p) {
+                RuntimeCache c(cfg.sets, cfg.ways, cfg.line);
+                c.set_policy(p);
+                run_real_trace(c, *trace_pair.second);
+                return c.hit_rate() * 100.0;
+            };
+            double lfsr_pct = run_policy(RuntimeCache::Policy::LFSR);
+            double lru_pct  = run_policy(RuntimeCache::Policy::LRU);
+            double mru_pct  = run_policy(RuntimeCache::Policy::MRU);
+            double plru_pct = run_policy(RuntimeCache::Policy::PLRU);
+            double nru_pct  = run_policy(RuntimeCache::Policy::NRU);
+            double lfu_pct  = run_policy(RuntimeCache::Policy::LFU);
 
             uint64_t opt_hits, opt_misses;
             run_opt(cfg.sets, cfg.ways, cfg.line, *trace_pair.second, opt_hits, opt_misses);
             double opt_pct = 100.0 * opt_hits / (opt_hits + opt_misses);
 
-            std::printf("%-10s %6zu %5zu %6zu | %8.2f%% %8.2f%% %8.2f%% %8.2f%%\n",
+            std::printf("%-10s %6zu %5zu %6zu | %7.2f%% %7.2f%% %7.2f%% %7.2f%% %7.2f%% %7.2f%% | %7.2f%%\n",
                 cfg.dim.c_str(), cfg.sets, cfg.ways, cfg.line,
-                c_lfsr.hit_rate() * 100.0, c_lru.hit_rate() * 100.0,
-                c_mru.hit_rate() * 100.0, opt_pct);
+                lfsr_pct, lru_pct, mru_pct, plru_pct, nru_pct, lfu_pct, opt_pct);
         }
     }
 

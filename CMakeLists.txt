@@ -250,6 +250,13 @@ if(TIMING_MODEL MATCHES "^CYCLE6_AXI(128|256|512|1024)?$")
   add_executable(axi_external_demo tools/axi_external_demo/axi_external_demo.cpp)
   target_link_libraries(axi_external_demo PRIVATE riscv_vp_core)
   target_compile_options(axi_external_demo PRIVATE -Wno-error -Wno-unused-parameter -Wno-unused-variable -Wno-deprecated-declarations)
+
+  # axi_burst_stress -- bulk multi-beat block-transfer sweep (512B/4KB/64KB)
+  # to differentiate AXI widths above 128-bit, where per-line CPU benchmarks
+  # structurally cannot (a 16B line already fits in 1 beat at 128-bit).
+  add_executable(axi_burst_stress tools/axi_burst_stress/axi_burst_stress.cpp)
+  target_link_libraries(axi_burst_stress PRIVATE riscv_vp_core)
+  target_compile_options(axi_burst_stress PRIVATE -Wno-error -Wno-unused-parameter -Wno-unused-variable -Wno-deprecated-declarations)
 endif()
 
 # =============================================================================

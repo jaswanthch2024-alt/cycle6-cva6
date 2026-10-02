@@ -19,11 +19,16 @@ public:
   // Builds the arbiter + per-master AXI managers + memory slave during
   // elaboration, all clocked by `clk`. `slave_latency` is the N-cycle memory
   // response used for calibration (uncontended cost ~= slave_latency + wrapper).
-  // `burst_beats` is the INCR burst length used for every refill read
-  // (default 2, matching CVA6's real 64-bit AXI width); pass a different
-  // value only for side-by-side "wider AxiDataWidth" experiments -- see
-  // AxiRefillMaster.h.
-  AxiContentionTop(sc_core::sc_clock* clk, int slave_latency, int burst_beats = 2);
+  // `icache_burst_beats`/`dcache_burst_beats` are the INCR burst length used
+  // for I$ vs D$/store refills respectively (default 2 each, matching CVA6's
+  // real 64-bit AXI width with a 16B line). I$ and D$ each get their OWN
+  // AxiRefillMaster instance (see AxiContentionTop.cpp), so their beat counts
+  // are genuinely independent -- pass different values when the two caches
+  // are configured with different line widths, or for side-by-side "wider
+  // AxiDataWidth" experiments -- see AxiRefillMaster.h. STORE (master index 2)
+  // reuses dcache_burst_beats, since stores write D$-sized lines.
+  AxiContentionTop(sc_core::sc_clock* clk, int slave_latency,
+                    int icache_burst_beats = 2, int dcache_burst_beats = 2);
   ~AxiContentionTop();
 
   // Post a memory request for master m (idempotent while held). Call once at a

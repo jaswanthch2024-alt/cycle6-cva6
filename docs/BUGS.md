@@ -888,3 +888,35 @@ its fix, verified down to ~0.0% error.
   `dmiss_tail` (stale results could complete a reallocated ROB entry).
 - **Linux boot on the frozen defaults:** 136,596,724 instr / 222,179,066 cycles, **IPC 0.615**,
   4,272,919 mispredicts (76.5%), I$ 4.22M / D$ 1.29M misses, 426 s wall-clock (host shared).
+
+### B16. FP timing aligned to CVA6 RTL; locality and cache-sweep benchmarks on RTL *(2026-10-02)*
+- **What the old "FPnew latency" gap really was.** The dependent-chain microbenchmarks (`fadd.d a,a,b`) read
+  *and write* the same register, so they measure latency **plus** CVA6's same-destination commit wait (as for
+  integers, §B12). Proof (`tests/fpmb/fpmb_fq_*`): a same-register FP op with no data dependency
+  (`fq_fadd_wawonly`) costs 5 cycles/op on RTL; alternating-register chains cost less than same-register ones.
+  Raising latencies to the chain cost (5) fixed the microbenchmarks but overshot `fp_bench`/`fp_stress` by
+  +12-13%, which is why the earlier flat re-fit "overshot the aggregates".
+- **Model now:** (1) an op whose rd (int or FP) is still the destination of an uncommitted FPU op waits for
+  that commit (`VP_FPU_WAW=0` disables); (2) true latencies = RTL chain cost − 1: `fadd/fsub/fmul/fmadd.d` 4,
+  `fadd/fsub/fmul.s` 3, `fmadd.s` 4, `fdiv/fsqrt.d` 23, `fdiv/fsqrt.s` 13, `fsgnj/fmin/fmax` 3, compares 3,
+  FP→int converts 4, `fmv.x` 2; (3) `fpu_wrap.sv` behaviour: add/mul ops keep issuing while div/sqrt runs
+  (the VP used to stall every FP op), and a div/sqrt behind a busy div/sqrt waits in a one-entry hold
+  register, starting one cycle before the previous result leaves (`VP_FPU_LEGACY_BLOCK=1` = old).
+- **Results** (RTL / VP): all chain tests (add, sub, mul, fmadd, div, sqrt; .d and .s), sign-inject, min, moves
+  both ways, `fsd` after `fadd`, alternating-register and WAW-only tests within 0.3%. Residuals: compare→int
+  use +4.6%, convert→int use +3.9%, FP load→use −4.9%, back-to-back sqrt/div +2.2% (RTL lies between two
+  whole-cycle values). **fp_bench −3.50% → +0.35%; fp_stress −4.84% → +3.22%.** No other benchmark moved.
+- **Memory benchmarks newly on RTL** (`tests/mem/`, shared crt0, same ELF): `cache_sweep_bench` RTL 10,283,200
+  vs VP 10,163,638 (−1.16%); `locality_bench` RTL 7,439,113 vs VP 6,898,872 (**−7.26%**) with identical D$
+  misses (262,757 / 262,705). Same open mechanism as `dmiss_d8` (§B15): the RTL charges about 2 more cycles
+  per miss when misses are interleaved with hits.
+
+### B17. `median` was compared across two different binaries *(2026-10-05)*
+- `systemc/samples/median_bare_vp.hex` (VP) and `median_bare.csv` (RTL) are **different builds**; all other
+  benchmarks were checked to be the same ELF (the eight microbenchmarks, multiply, SpMV integer, ptr_chase,
+  mem_contention, and everything under `tests/`). The RTL ELF cannot run on the VP as-is: its data sits on the
+  VP's HTIF stop address 0x80001000.
+- Rebuilt with the shared crt0/link.ld (`tests/median/`), same ELF on both sides, results identical (result
+  0x771153e19c617790): RTL 3,774,612 cycles / 2,076,365 instr (IPC 0.550), VP 4,030,227 / 2,076,354 (IPC 0.515):
+  **cycles +6.77%, IPC −6.34%**. Mispredicts 269,506 vs 269,508; D$ misses 301 RTL. The earlier "+1.2%" was not
+  a valid comparison. Cause not yet isolated (branch counts match, so a pipeline effect).

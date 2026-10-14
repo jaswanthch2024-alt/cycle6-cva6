@@ -54,13 +54,9 @@ private:
 
     void tick() {
         while (true) {
-            // Tick at 1µs intervals = 1MHz reference clock, matching DTS
-            // timebase-frequency = 1000000.  With CONFIG_HZ=250 the kernel
-            // programs delta = 1000000/250 = 4000 ticks per jiffy = 4ms of
-            // simulation time = ~400K CPU cycles between timer interrupts.
-            // Previous 1ms (1kHz) rate was 1000× too slow: the kernel computed
-            // mtimecmp = mtime + 4000 ticks which at 1kHz = 4 seconds of simtime
-            // per jiffy, starving rcu_sched for billions of cycles.
+            // 1 MHz, the timebase-frequency in the device tree. With
+            // CONFIG_HZ=250 that is 4000 ticks (4 ms, about 400K CPU cycles)
+            // per jiffy. A slower tick starved rcu_sched (BUG-19).
             wait(1, sc_core::SC_US);
             ++m_mtime;
             m_update_event.notify();
@@ -73,7 +69,7 @@ private:
         uint64_t addr = trans.get_address();
         unsigned char *ptr = trans.get_data_ptr();
         unsigned len = trans.get_data_length();
-        // Offsets (RV privileged spec) — using only 64-bit mtimecmp/mtime
+        // Offsets (RV privileged spec): using only 64-bit mtimecmp/mtime
         // 0x4000: mtimecmp (low 32) 0x4004: high 32  (we accept 8B)
         // 0xBFF8: mtime     (low 32) 0xBFFC: high 32
         if (len == 8) {

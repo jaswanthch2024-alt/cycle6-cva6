@@ -114,32 +114,32 @@ public:
                 latency = 1;
                 break;
             }
-            case OP_F_FADD_S: { regs->setF32(rd, regs->getF32(get_rs1()) + regs->getF32(get_rs2())); latency = 4; break; }
-            case OP_F_FSUB_S: { regs->setF32(rd, regs->getF32(get_rs1()) - regs->getF32(get_rs2())); latency = 4; break; }
-            case OP_F_FMUL_S: { regs->setF32(rd, regs->getF32(get_rs1()) * regs->getF32(get_rs2())); latency = 4; break; }
-            case OP_F_FDIV_S: { regs->setF32(rd, regs->getF32(get_rs1()) / regs->getF32(get_rs2())); latency = 12; break; }
-            case OP_F_FSQRT_S: { regs->setF32(rd, std::sqrt(regs->getF32(get_rs1()))); latency = 14; break; }
-            case OP_F_FMADD_S: { regs->setF32(rd, std::fma(regs->getF32(get_rs1()), regs->getF32(get_rs2()), regs->getF32(get_rs3()))); latency = 5; break; }
-            case OP_F_FMSUB_S: { regs->setF32(rd, std::fma(regs->getF32(get_rs1()), regs->getF32(get_rs2()), -regs->getF32(get_rs3()))); latency = 5; break; }
-            case OP_F_FNMSUB_S:{ regs->setF32(rd, -std::fma(regs->getF32(get_rs1()), regs->getF32(get_rs2()), -regs->getF32(get_rs3()))); latency = 5; break; }
-            case OP_F_FNMADD_S:{ regs->setF32(rd, -std::fma(regs->getF32(get_rs1()), regs->getF32(get_rs2()), regs->getF32(get_rs3()))); latency = 5; break; }
+            case OP_F_FADD_S: { regs->setF32(rd, regs->getF32(get_rs1()) + regs->getF32(get_rs2())); latency = 3; break; }
+            case OP_F_FSUB_S: { regs->setF32(rd, regs->getF32(get_rs1()) - regs->getF32(get_rs2())); latency = 3; break; }
+            case OP_F_FMUL_S: { regs->setF32(rd, regs->getF32(get_rs1()) * regs->getF32(get_rs2())); latency = 3; break; }
+            case OP_F_FDIV_S: { regs->setF32(rd, regs->getF32(get_rs1()) / regs->getF32(get_rs2())); latency = 13; break; }
+            case OP_F_FSQRT_S: { regs->setF32(rd, std::sqrt(regs->getF32(get_rs1()))); latency = 13; break; }
+            case OP_F_FMADD_S: { regs->setF32(rd, std::fma(regs->getF32(get_rs1()), regs->getF32(get_rs2()), regs->getF32(get_rs3()))); latency = 4; break; }
+            case OP_F_FMSUB_S: { regs->setF32(rd, std::fma(regs->getF32(get_rs1()), regs->getF32(get_rs2()), -regs->getF32(get_rs3()))); latency = 4; break; }
+            case OP_F_FNMSUB_S:{ regs->setF32(rd, -std::fma(regs->getF32(get_rs1()), regs->getF32(get_rs2()), -regs->getF32(get_rs3()))); latency = 4; break; }
+            case OP_F_FNMADD_S:{ regs->setF32(rd, -std::fma(regs->getF32(get_rs1()), regs->getF32(get_rs2()), regs->getF32(get_rs3()))); latency = 4; break; }
             case OP_F_FSGNJ_S: { regs->setF32(rd, std::copysign(std::fabs(regs->getF32(get_rs1())),  regs->getF32(get_rs2()))); latency = 2; break; }
             case OP_F_FSGNJN_S:{ regs->setF32(rd, std::copysign(std::fabs(regs->getF32(get_rs1())), -regs->getF32(get_rs2()))); latency = 2; break; }
             case OP_F_FSGNJX_S:{ float a=regs->getF32(get_rs1()),b=regs->getF32(get_rs2()); regs->setF32(rd,std::copysign(a,a*b)); latency = 2; break; }
             case OP_F_FMIN_S:  { regs->setF32(rd, std::fmin(regs->getF32(get_rs1()), regs->getF32(get_rs2()))); latency = 2; break; }
             case OP_F_FMAX_S:  { regs->setF32(rd, std::fmax(regs->getF32(get_rs1()), regs->getF32(get_rs2()))); latency = 2; break; }
-            case OP_F_FEQ_S: { regs->setValue(rd, regs->getF32(get_rs1()) == regs->getF32(get_rs2() ) ? 1 : 0); latency = 2; break; }
-            case OP_F_FLT_S: { regs->setValue(rd, regs->getF32(get_rs1()) <  regs->getF32(get_rs2()) ? 1 : 0); latency = 2; break; }
-            case OP_F_FLE_S: { regs->setValue(rd, regs->getF32(get_rs1()) <= regs->getF32(get_rs2()) ? 1 : 0); latency = 2; break; }
-            case OP_F_FCVT_W_S: { regs->setValue(rd, static_cast<int64_t>(static_cast<int32_t>(regs->getF32(get_rs1())))); latency = 2; break; }
-            case OP_F_FCVT_WU_S:{ regs->setValue(rd, static_cast<int64_t>(static_cast<uint32_t>(regs->getF32(get_rs1())))); latency = 2; break; }
-            case OP_F_FCVT_L_S: { regs->setValue(rd, static_cast<int64_t>(regs->getF32(get_rs1()))); latency = 2; break; }
-            case OP_F_FCVT_LU_S:{ regs->setValue(rd, static_cast<int64_t>(static_cast<uint64_t>(regs->getF32(get_rs1())))); latency = 2; break; }
+            case OP_F_FEQ_S: { regs->setValue(rd, regs->getF32(get_rs1()) == regs->getF32(get_rs2() ) ? 1 : 0); latency = 3; break; }
+            case OP_F_FLT_S: { regs->setValue(rd, regs->getF32(get_rs1()) <  regs->getF32(get_rs2()) ? 1 : 0); latency = 3; break; }
+            case OP_F_FLE_S: { regs->setValue(rd, regs->getF32(get_rs1()) <= regs->getF32(get_rs2()) ? 1 : 0); latency = 3; break; }
+            case OP_F_FCVT_W_S: { regs->setValue(rd, static_cast<int64_t>(static_cast<int32_t>(regs->getF32(get_rs1())))); latency = 4; break; }
+            case OP_F_FCVT_WU_S:{ regs->setValue(rd, static_cast<int64_t>(static_cast<uint32_t>(regs->getF32(get_rs1())))); latency = 4; break; }
+            case OP_F_FCVT_L_S: { regs->setValue(rd, static_cast<int64_t>(regs->getF32(get_rs1()))); latency = 4; break; }
+            case OP_F_FCVT_LU_S:{ regs->setValue(rd, static_cast<int64_t>(static_cast<uint64_t>(regs->getF32(get_rs1())))); latency = 4; break; }
             case OP_F_FCVT_S_W: { regs->setF32(rd, static_cast<float>(static_cast<int32_t>(rs1_val))); latency = 2; break; }
             case OP_F_FCVT_S_WU:{ regs->setF32(rd, static_cast<float>(static_cast<uint32_t>(rs1_val))); latency = 2; break; }
             case OP_F_FCVT_S_L: { regs->setF32(rd, static_cast<float>(static_cast<int64_t>(rs1_val))); latency = 2; break; }
             case OP_F_FCVT_S_LU:{ regs->setF32(rd, static_cast<float>(static_cast<uint64_t>(rs1_val))); latency = 2; break; }
-            case OP_F_FMV_X_W: { regs->setValue(rd, static_cast<int64_t>(static_cast<int32_t>(regs->getFPValue(get_rs1()) & 0xFFFFFFFF))); latency = 1; break; }
+            case OP_F_FMV_X_W: { regs->setValue(rd, static_cast<int64_t>(static_cast<int32_t>(regs->getFPValue(get_rs1()) & 0xFFFFFFFF))); latency = 2; break; }
             case OP_F_FMV_W_X: { regs->setFPValue(rd, 0xFFFFFFFF00000000ULL | (rs1_val & 0xFFFFFFFF)); latency = 1; break; }
             case OP_F_FCLASS_S: { regs->setValue(rd, fclass_s(regs->getF32(get_rs1()))); latency = 1; break; }
             default: latency = 0; break;

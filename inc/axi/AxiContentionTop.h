@@ -1,10 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-// AxiContentionTop — thin, matchlib-free interface to the AXI I$/D$ contention
-// subsystem. The CPU pipeline includes ONLY this header (no matchlib templates
-// in CPU_P64_6_Cycle's translation unit); the heavy matchlib instantiation
-// lives entirely in AxiContentionTop.cpp behind a PIMPL.
-//
-// Used only by the CYCLE6_AXI build (ENABLE_AXI_CONTENTION).
+// Interface to the AXI refill model (CYCLE6_AXI builds only). The matchlib
+// templates stay in AxiContentionTop.cpp behind a pimpl, so the CPU code
+// doesn't have to compile them.
 #pragma once
 #include <cstdint>
 
@@ -16,43 +13,25 @@ class AxiContentionTop {
 public:
   enum Master { ICACHE = 0, DCACHE = 1, STORE = 2, NUM_MASTERS = 3 };
 
-  // Builds the arbiter + per-master AXI managers + memory slave during
-  // elaboration, all clocked by `clk`. `slave_latency` is the N-cycle memory
-  // response used for calibration (uncontended cost ~= slave_latency + wrapper).
-  // `icache_burst_beats`/`dcache_burst_beats` are the INCR burst length used
-  // for I$ vs D$/store refills respectively (default 2 each, matching CVA6's
-  // real 64-bit AXI width with a 16B line). I$ and D$ each get their OWN
-  // AxiRefillMaster instance (see AxiContentionTop.cpp), so their beat counts
-  // are genuinely independent -- pass different values when the two caches
-  // are configured with different line widths, or for side-by-side "wider
-  // AxiDataWidth" experiments -- see AxiRefillMaster.h. STORE (master index 2)
-  // reuses dcache_burst_beats, since stores write D$-sized lines.
+  // Builds the arbiter, one AXI master per requester and the memory slave,
+  // all on clk. slave_latency is the fitted memory latency. Burst lengths are
+  // per cache (2 beats for a 16 B line on a 64-bit bus); STORE uses the D$ one.
   AxiContentionTop(sc_core::sc_clock* clk, int slave_latency,
                     int icache_burst_beats = 2, int dcache_burst_beats = 2);
   ~AxiContentionTop();
 
-  // Post a memory request for master m (idempotent while held). Call once at a
-  // miss trigger, then poll done(m). `wdata` is the real value: for a write,
-  // the value being stored; for a read, the value the CPU already fetched via
-  // its normal (mem_intf/fetch_instruction) path -- this is handed back
-  // verbatim by data() once done(), so the AXI channel carries the CPU's
-  // actual data instead of a synthetic placeholder from the internal slave's
-  // toy backing array. Pass 0 if not yet known (see set_pending_wdata()).
+  // Post a request for master m, then poll done(m). Posting again while it is
+  // held does nothing. wdata is the store value for a write; for a read it is
+  // the value the CPU already read over TLM, and data() returns it so it can
+  // be checked. Pass 0 if it isn't known yet and set it later.
   void request(int m, uint64_t addr, bool is_write = false, uint64_t wdata = 0);
-  // Updates the real value for an already-posted, still-in-flight request
-  // (for the rare case -- e.g. a DTLB miss stacked with a D$ miss -- where
-  // the real value isn't known yet at request() time). Safe to call any time
-  // before done() first returns true.
+  // Set the value of a request still in flight (DTLB miss followed by a D$
+  // miss, where the value is read after the request goes out).
   void set_pending_wdata(int m, uint64_t wdata);
-  // True once the request for m has completed through arbiter + slave.
   bool done(int m) const;
-  // Returned read data (valid when done(m)): the real value passed to
-  // request()/set_pending_wdata(), handed back through the AXI channel.
-  uint64_t data(int m) const;
-  // Acknowledge completion: drops the request so the master can serve the next.
-  void ack(int m);
-  // True while a request for m is in flight (posted, not yet acked).
-  bool busy(int m) const;
+  uint64_t data(int m) const;      // valid once done(m)
+  void ack(int m);                 // drop the request so the next one can go
+  bool busy(int m) const;          // posted and not acked yet
 
 private:
   struct Impl;

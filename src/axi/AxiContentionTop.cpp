@@ -1,9 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-// AxiContentionTop implementation — the only translation unit that pulls in the
-// heavy matchlib templates. Builds a real matchlib AxiArbiter with NUM_MASTERS
-// AXI managers (I$, D$, store-drain) contending for one downstream memory
-// slave. Behind the PIMPL in AxiContentionTop.h so CPU_P64_6_Cycle never sees
-// matchlib. CYCLE6_AXI build only.
+// matchlib AxiArbiter with one master each for I$, D$ and store drain in
+// front of a single memory slave. Only this file includes matchlib.
 #define SC_INCLUDE_DYNAMIC_PROCESSES
 #include "axi/AxiContentionTop.h"
 
@@ -64,16 +61,13 @@ struct AxiContentionTop::Impl : public sc_module {
 
       rch[i] = new local_axi::read::chan<>(sc_gen_unique_name("rch"));
       wch[i] = new local_axi::write::chan<>(sc_gen_unique_name("wch"));
-      // Each master gets its own beat count: I$ (index ICACHE) uses the I$
-      // line width, D$ and STORE (which writes D$-sized lines) use the D$
-      // line width -- independent AxiRefillMaster instances, so this is
-      // genuinely per-cache, not a shared/contaminated value.
+      // I$ uses its own line size; D$ and STORE use the D$ one.
       int beats_for_master = (i == ICACHE) ? icache_burst_beats : dcache_burst_beats;
       master[i] = new AxiRefillMaster(sc_gen_unique_name("axi_master"), beats_for_master);
       master[i]->clk(*clk_);
       master[i]->rst_bar(rst_bar);
 
-      // master binds whole channel; arbiter binds the split sub-channels
+      // the master binds the whole channel, the arbiter its read/write halves
       master[i]->r_master0(*rch[i]);
       arbiter->axi_rd_m_ar[i]((*rch[i]).ar);
       arbiter->axi_rd_m_r[i]((*rch[i]).r);

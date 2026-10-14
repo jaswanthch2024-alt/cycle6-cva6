@@ -13,33 +13,21 @@ struct StoreBufferEntry {
     bool     valid{false};
     uint64_t address{0};
     uint64_t data{0};
-    int      size{0};       // bytes: 1, 2, 4, or 8
-    int      trans_id{-1};  // scoreboard transaction ID
+    int      size{0};       // 1, 2, 4 or 8 bytes
+    int      trans_id{-1};  // scoreboard id
 };
 
-// CVA6-aligned split store buffer — proper FIFO implementation.
-//   SPEC_DEPTH   — speculative queue: stores added when address is computed (EX),
-//                  before instruction commits.
-//   COMMIT_DEPTH — committed queue: stores moved here at commit, drained to
-//                  memory one-per-cycle asynchronously.
-//
-// Both queues use head/tail FIFO pointers so that chronological order is always
-// preserved, enabling correct newest-first forwarding regardless of slot reuse.
-//
-// forward_load search order: spec (newest→oldest) then committed (newest→oldest).
-// Spec stores are YOUNGER than committed stores — they executed more recently and
-// have not yet been written to memory — so spec takes priority in forwarding.
-//
-// On branch mispredict: speculative queue is NOT flushed in this pipeline because
-// no wrong-path instruction reaches EX before the mispredict is detected.
-// flush_speculative() is provided for future MMU exception recovery.
+// Store buffer split like CVA6's: stores enter the speculative FIFO in EX and
+// move to the committed FIFO at commit, which drains one store per cycle.
+// Both are ring buffers so age order survives slot reuse (BUG-11).
+// Speculative stores are younger than committed ones, so forwarding searches
+// the speculative FIFO first.
 template<std::size_t SPEC_DEPTH = 4, std::size_t COMMIT_DEPTH = 4>
 class StoreBuffer {
 public:
     StoreBuffer() = default;
 
-    // Push store onto speculative FIFO tail (called in EX when address is computed).
-    // Returns the slot index written, or -1 if full.
+    // Called in EX once the address is known. Returns the slot, or -1 if full.
     int add_store(uint64_t address, uint64_t data, int size, int trans_id) {
         if (spec_count == SPEC_DEPTH) return -1;
         spec[spec_tail] = {true, address, data, size, trans_id};
@@ -49,13 +37,12 @@ public:
         return slot;
     }
 
-    // Pop the oldest spec entry and push it onto the committed FIFO tail.
-    // Called at commit for store instructions. In-order pipeline guarantee:
-    // spec_head always holds the store currently at the scoreboard head.
-    // Returns false if the committed queue is full (caller should stall commit).
+    // Called at commit. Commit is in order, so the store being committed is
+    // always at spec_head. Returns false if the committed FIFO is full and
+    // commit has to stall.
     bool commit_store(int /*trans_id*/) {
         if (spec_count == 0)            return false;
-        if (commit_count == COMMIT_DEPTH) return false; // committed queue full
+        if (commit_count == COMMIT_DEPTH) return false;
         committed[commit_tail] = spec[spec_head];
         committed[commit_tail].valid = true;
         commit_tail = (commit_tail + 1) % COMMIT_DEPTH;
@@ -66,7 +53,8 @@ public:
         return true;
     }
 
-    // Drain the oldest committed entry to memory (call once per cycle).
+    // Write out the oldest committed store; called once per cycle. Entries
+    // invalidated by an AMO are skipped.
     bool drain_one(uint64_t& addr, uint64_t& data, int& size) {
         while (commit_count > 0) {
             addr = committed[commit_head].address;
@@ -85,36 +73,26 @@ public:
         return false;
     }
 
-    // Load-to-store forwarding result.
     enum class FwdResult {
-        HIT,            // Store fully contains load; fwd_data is valid
-        PARTIAL_OVERLAP,// Store overlaps load but doesn't contain it; load must STALL
-        MISS            // No overlapping store; safe to read from memory
+        HIT,             // load fully inside one store, fwd_data valid
+        PARTIAL_OVERLAP, // overlaps but not contained, load has to stall
+        MISS             // no overlap, read memory
     };
 
-    // Load-to-store forwarding using CVA6's 12-bit page-offset alias check.
-    //
-    // Searches spec newest→oldest first (spec stores are younger than committed),
-    // then committed newest→oldest.  Returns the value of the youngest store older
-    // than the load that targets the same address and access size.
-    //
-    // PARTIAL_OVERLAP: when a buffered store overlaps the load but doesn't fully
-    // contain it, the load cannot be forwarded (we'd return a mix of store-buffer
-    // and memory data).  The load must stall until the overlapping store drains.
+    // Youngest store first. A load that only partly overlaps a store can't be
+    // forwarded without mixing buffer and memory bytes, so it waits for the
+    // store to drain (BUG-12, the SLUB corruption during boot).
     FwdResult forward_load(uint64_t load_addr, int load_size, uint64_t& fwd_data) {
-        // Spec queue: newest (tail-1) → oldest (head)
         for (std::size_t k = 0; k < spec_count; k++) {
             std::size_t i = (spec_tail + SPEC_DEPTH - 1 - k) % SPEC_DEPTH;
             if (spec[i].valid) {
                 uint64_t store_addr = spec[i].address;
                 int store_size = spec[i].size;
 
-                // Check if there is any overlap between load and store ranges
                 uint64_t overlap_start = std::max(load_addr, store_addr);
                 uint64_t overlap_end = std::min(load_addr + load_size, store_addr + store_size);
 
                 if (overlap_start < overlap_end) {
-                    // Overlap exists. Check if load is fully contained within the store
                     if (load_addr >= store_addr && (load_addr + load_size) <= (store_addr + store_size)) {
                         int offset = load_addr - store_addr;
                         uint64_t shifted = spec[i].data >> (offset * 8);
@@ -122,25 +100,20 @@ public:
                         fwd_data = shifted & mask;
                         return FwdResult::HIT;
                     }
-                    // Younger store overlaps but does not fully contain the load.
-                    // Caller must stall until overlapping stores drain to memory.
                     return FwdResult::PARTIAL_OVERLAP;
                 }
             }
         }
-        // Committed queue: newest (tail-1) → oldest (head)
         for (std::size_t k = 0; k < commit_count; k++) {
             std::size_t i = (commit_tail + COMMIT_DEPTH - 1 - k) % COMMIT_DEPTH;
             if (committed[i].valid) {
                 uint64_t store_addr = committed[i].address;
                 int store_size = committed[i].size;
 
-                // Check if there is any overlap between load and store ranges
                 uint64_t overlap_start = std::max(load_addr, store_addr);
                 uint64_t overlap_end = std::min(load_addr + load_size, store_addr + store_size);
 
                 if (overlap_start < overlap_end) {
-                    // Overlap exists. Check if load is fully contained within the store
                     if (load_addr >= store_addr && (load_addr + load_size) <= (store_addr + store_size)) {
                         int offset = load_addr - store_addr;
                         uint64_t shifted = committed[i].data >> (offset * 8);
@@ -148,8 +121,6 @@ public:
                         fwd_data = shifted & mask;
                         return FwdResult::HIT;
                     }
-                    // Younger store overlaps but does not fully contain the load.
-                    // Caller must stall until overlapping stores drain to memory.
                     return FwdResult::PARTIAL_OVERLAP;
                 }
             }
@@ -157,11 +128,8 @@ public:
         return FwdResult::MISS;
     }
 
-    // Invalidate all store buffer entries (spec + committed) whose byte ranges
-    // overlap [addr, addr+size).  Must be called whenever an AMO or successful
-    // SC.W/SC.D writes directly to physical memory, bypassing this store buffer,
-    // so that a subsequent load to the same address reads from memory rather than
-    // being served stale pre-AMO data by forward_load().
+    // AMOs and SC write memory directly, past this buffer. Drop any buffered
+    // store they overlap, otherwise a later load would forward the old value.
     void invalidate_address(uint64_t addr, int size) {
         uint64_t end = addr + static_cast<uint64_t>(size);
         for (auto& e : spec) {
@@ -178,20 +146,17 @@ public:
         }
     }
 
-    // --- Capacity checks ---
-
     bool spec_is_full()   const { return spec_count   == SPEC_DEPTH;   }
     bool commit_is_full() const { return commit_count  == COMMIT_DEPTH; }
     bool is_full()        const { return spec_is_full(); }
     bool is_empty()       const { return spec_count == 0 && commit_count == 0; }
-
-    // --- Flush helpers ---
 
     void flush_speculative() {
         for (auto& e : spec) e.valid = false;
         spec_head = spec_tail = spec_count = 0;
     }
 
+    // Drop speculative stores from the tail whose scoreboard entry was flushed.
     template<std::size_t SB_SIZE>
     void flush_speculative(int branch_rob_idx, const Scoreboard<SB_SIZE>& scoreboard) {
         while (spec_count > 0) {
@@ -222,6 +187,8 @@ private:
     std::array<StoreBufferEntry, COMMIT_DEPTH> committed{};
     std::size_t commit_head{0}, commit_tail{0}, commit_count{0};
 
+    // Unused. CVA6 (store_buffer.sv) only compares address bits [11:3] and
+    // makes the load wait for the drain on a match; we compare byte ranges.
     static bool alias_check(uint64_t a, uint64_t b) {
         return (a & 0xFFFULL) == (b & 0xFFFULL);
     }

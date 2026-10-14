@@ -11,7 +11,7 @@
 
 namespace riscv_tlm {
 
-// sv39 Memory Management Unit — TLBs + Page Table Walker.
+// sv39 Memory Management Unit: TLBs + Page Table Walker.
 //
 // Design (CVA6-aligned):
 //   ITLB: 16-entry fully associative (instruction-side)
@@ -21,9 +21,9 @@ namespace riscv_tlm {
 //         representing a warm PTW cache).
 //
 // Access types (access_t):
-//   FETCH = 0   — instruction fetch (uses ITLB)
-//   LOAD  = 1   — data read  (uses DTLB)
-//   STORE = 2   — data write (uses DTLB)
+//   FETCH = 0: instruction fetch (uses ITLB)
+//   LOAD  = 1: data read  (uses DTLB)
+//   STORE = 2: data write (uses DTLB)
 class MMU {
 public:
     enum access_t : uint8_t { FETCH = 0, LOAD = 1, STORE = 2 };
@@ -49,7 +49,7 @@ public:
         const PrivMode priv = csr.priv;
 
         // Bare-metal or M-mode with MPRV=0: no translation.
-        bool vm_active = ((satp >> 60) == 8); // MODE field == 8 → sv39
+        bool vm_active = ((satp >> 60) == 8); // MODE field == 8 -> sv39
         if (!vm_active || priv == PrivMode::M) {
             return {true, false, 0, vaddr, 0};
         }
@@ -73,7 +73,7 @@ public:
             return r;
         }
 
-        // TLB miss → PTW.
+        // TLB miss -> PTW.
         if (atype == FETCH) stats.itlb_misses++; else stats.dtlb_misses++;
         stats.ptw_walks++;
 
@@ -99,7 +99,7 @@ public:
     }
 
     // -------------------------------------------------------------------------
-    // SFENCE.VMA — Phase 9.
+    // SFENCE.VMA.
     // rs1=0 means flush all VA; rs2=0 means flush all ASIDs.
     // -------------------------------------------------------------------------
     void sfence_vma(uint64_t rs1_val, uint64_t rs2_val, bool rs1_zero, bool rs2_zero) {
@@ -191,7 +191,7 @@ private:
                 }
             }
 
-            // Pack perm: bits [4:1] of PTE → stored as bits [3:0] in perm byte
+            // Pack perm: bits [4:1] of PTE -> stored as bits [3:0] in perm byte
             uint8_t perm = static_cast<uint8_t>((pte >> 1) & 0xF); // R,W,X,U
 
             // Permission check at PTW time

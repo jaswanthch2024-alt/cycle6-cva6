@@ -8,48 +8,26 @@
 
 namespace riscv_tlm {
 
-// N-way set-associative cache with a SELECTABLE replacement policy.
+// Set-associative cache, tags only (no data). Replacement defaults to LFSR
+// random like the CVA6 L1s (cva6_icache.sv, wt_dcache_missunit.sv): fill an
+// invalid way if there is one, otherwise evict the way an 8-bit LFSR picks.
+// We had LRU before; on scans larger than the cache it evicts the line about
+// to be reused and over-missed by about 22% (BUGS.md B8).
 //
-// Default is LFSR pseudo-random, matching the CVA6 L1 caches (cva6_icache.sv
-// and wt_dcache_missunit.sv): on a miss, fill an invalid way if one exists,
-// otherwise evict a way chosen by an 8-bit LFSR. This is the policy real CVA6
-// silicon implements, and is what every RTL-accuracy comparison in this
-// project uses — see docs/BUGS.md §B8 (LRU was pathologically bad on
-// sequential scans larger than the cache: it evicts exactly the line about to
-// be reused, which made the VP over-miss by ~22% vs CVA6 on memory-bound
-// code).
+// LRU, MRU, PLRU, NRU and LFU can be selected for comparison, but CVA6 only
+// has LFSR. When comparing, don't use only large sequential scans: they are
+// LRU's worst case. Use workloads with a hot set that gets reused.
 //
-// LRU is also implemented and selectable via set_policy(), but ONLY for
-// side-by-side policy comparison on your own workloads -- it is NOT a
-// second CVA6-accurate mode (real CVA6 never uses LRU). Do not use LRU
-// results as an RTL-accuracy claim.
-//
-// IMPORTANT when comparing LRU vs LFSR: the benchmarks built during the §B8
-// investigation (large sequential scans of a working set > cache size) are
-// LRU's textbook WORST case and LFSR's best case -- testing only with those
-// is circular, since that access pattern is exactly why LFSR was adopted.
-// A fair comparison needs workloads with genuine temporal locality (a hot
-// working set reused many times, ideally close to or under cache capacity),
-// where LRU's "recently used = likely reused soon" assumption actually holds.
-//
-// SETS, WAYS and LINE_BYTES must be powers of 2.
-// Default: 64 sets × 4 ways × 64B lines = 16 KB (illustrative; real
-// instances are Cache<256,4,16> / Cache<256,8,16>).
+// SETS, WAYS and LINE_BYTES must be powers of 2. The defaults below are
+// placeholders; the CPU uses Cache<256,4,16> and Cache<256,8,16>.
 template<std::size_t SETS = 64, std::size_t WAYS = 4, std::size_t LINE_BYTES = 64>
 class Cache {
 public:
-    // Exposes the line size to callers outside the template (e.g. the AXI
-    // refill-burst-length calculation), since a non-type template parameter
-    // isn't otherwise nameable as Cache<...>::LINE_BYTES from outside.
+    // Line size for code outside the template (AXI burst length).
     static constexpr std::size_t LineBytes = LINE_BYTES;
 
-    // MRU, PLRU, NRU, LFU are comparison-only additions (like LRU above,
-    // NOT a second CVA6-accurate mode) -- ported from the verified
-    // tools/cache_sweep/RuntimeCache.h implementations (see that file's
-    // header comment for per-policy motivation and its hand-traced
-    // correctness tests) so VP_CACHE_POLICY comparisons can run on the
-    // real, cycle-accurate pipeline instead of only the standalone
-    // hit-rate exploration tool.
+    // Everything except LFSR is for comparison. MRU, PLRU, NRU and LFU come
+    // from tools/cache_sweep/RuntimeCache.h, which has the tests.
     enum class Policy { LFSR, LRU, MRU, PLRU, NRU, LFU };
 
     Cache() = default;

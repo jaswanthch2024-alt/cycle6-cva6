@@ -8,19 +8,19 @@
 
 namespace riscv_tlm {
 
-// Functional unit classification — matches CVA6 fu_t encoding
+// Functional unit classification: matches CVA6 fu_t encoding
 enum class FunctionalUnit : uint8_t {
     NONE   = 0,
     ALU    = 1,   // 1-cycle arithmetic/logic
     LSU    = 2,   // Load/store unit (variable latency)
     BRANCH = 3,   // Branch/jump unit (1-cycle)
     CSR    = 4,   // CSR unit (executes at commit)
-    MUL    = 5,   // Multiplier (2-cycle, Phase 3)
-    DIV    = 6,   // Divider (up to 64-cycle, Phase 3)
+    MUL    = 5,   // 2-cycle multiplier
+    DIV    = 6,   // serial divider, operand-dependent latency
     FPU    = 7    // Floating-point unit (variable latency)
 };
 
-// CVA6-aligned scoreboard — acts as both issue FIFO and reorder buffer.
+// CVA6-aligned scoreboard: acts as both issue FIFO and reorder buffer.
 // Results are stored inside entries (confirmed by CVA6 scoreboard.sv).
 // rd_clobber tracks which FU is producing each destination register.
 template<std::size_t SIZE = 32>
@@ -41,7 +41,7 @@ public:
         bool writes_to_fp_reg{false};
     };
 
-    // Per-register clobber info — CVA6 rd_clobber signal.
+    // Per-register clobber info: CVA6 rd_clobber signal.
     // Tells Issue stage which FU is producing a given register and
     // whether a forwarded value is already available.
     struct ClobberInfo {
@@ -68,7 +68,7 @@ public:
         return idx;
     }
 
-    // Called by EX when an instruction finishes — stores result in entry.
+    // Called by EX when an instruction finishes: stores result in entry.
     void complete(int idx, uint64_t result, uint8_t rd) {
         if (idx < 0 || static_cast<std::size_t>(idx) >= SIZE) return;
         entries[idx].ready  = true;

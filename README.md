@@ -1,4 +1,4 @@
-# RISC-V Virtual Platform (RISCV-VP)
+# Cycle6: a cycle-accurate SystemC/TLM-2.0 virtual prototype of the CVA6 core
 
 A cycle-accurate, CVA6-aligned RISC-V 64-bit virtual platform implemented in SystemC/TLM-2.0.
 Boots **Linux 6.1.0** to a BusyBox user-space shell on the 6-stage pipeline model, and includes
@@ -8,7 +8,7 @@ an optional real-AXI memory-contention model validated against CVA6 RTL co-simul
 [![C++17](https://img.shields.io/badge/C%2B%2B-17-blue.svg)](https://isocpp.org/)
 [![SystemC](https://img.shields.io/badge/SystemC-3.0.2-green.svg)](https://www.accellera.org/downloads/standards/systemc)
 
-**Repository:** [github.com/jaswanthch2024-alt/RISC-V-VP](https://github.com/jaswanthch2024-alt/RISC-V-VP)
+**Repository:** [github.com/jaswanthch2024-alt/cycle6-cva6](https://github.com/jaswanthch2024-alt/cycle6-cva6)
 
 ---
 
@@ -30,8 +30,8 @@ external beyond a C++17 compiler and CMake to build the default model.
 ## Quick Start — Build & Test on Your Own Desktop
 
 ```bash
-git clone https://github.com/jaswanthch2024-alt/RISC-V-VP.git riscv-vp
-cd riscv-vp
+git clone https://github.com/jaswanthch2024-alt/cycle6-cva6.git cycle6-cva6
+cd cycle6-cva6
 
 # Build the default cycle-accurate model
 mkdir -p build_cycle6 && cd build_cycle6
@@ -346,6 +346,7 @@ what-if experiments only, not an RTL-accuracy claim:
 | `VP_LOAD_LAT=N` (1–4) | 2 | D$-hit load-use stall cycles (1 = old model) |
 | `VP_WAW_BUBBLE=0/1/2` | 1 | Same-register stall: 0 = old shift-bubble rule, 2 = faithful commit wait (§B12) |
 | `VP_DMISS_EXTRA=N` / `VP_DMISS_BLOCK=N` | 5 / 3 | D$ miss fill tail and how much of it blocks the next miss (0 = old model) |
+| `VP_FPU_WAW=0`, `VP_FPU_LEGACY_BLOCK=1` | on / off | FP same-register commit wait; old "any FP op waits for div/sqrt" rule (§B16) |
 | `VP_WATCHDOG=N`, `VP_MP_TRACE=file` | off | Diagnostics: dump pipeline state if nothing retires for N cycles; log every mispredict PC |
 | `VP_DCACHE_SLOTS=N` (max 8) | 1 with AXI / 2 without | Number of D$ misses allowed outstanding at once (non-blocking D$ experiment, modelling what a wider MSHR like CVA6's HPDcache option would allow). Finding: raising this above the default had **no effect** on tested benchmarks — this pipeline's single-issue front end never generates more than ~2 concurrent outstanding misses regardless of slot capacity, so slot count isn't the bottleneck for non-blocking-cache-style concurrency here. |
 
@@ -486,13 +487,15 @@ benchmark's own timed region (its CSR counter readings) on both sides:
 | int_alu / int_nobranch / int_indep | 2,400,417 / 3,080,384 / 2,249,473 | 2,400,130 / 3,080,096 / 2,249,183 | −0.01% each |
 | long_test3 / robust_stress / multiply | 1,100,413 / 4,567,925 / 3,279,837 | 1,100,124 / 4,567,638 / 3,279,077 | −0.03% / −0.01% / −0.02% |
 | div_stress | 1,130,126 | 1,149,840 | +1.74% |
-| fp_bench / fp_stress | 2,600,478 / 6,200,440 | 2,509,560 / 5,900,141 | −3.50% / −4.84% |
+| fp_bench / fp_stress | 2,600,478 / 6,200,440 | 2,609,563 / 6,400,140 | +0.35% / +3.22% |
 | CoreMark (2K perf run, 10 iter., CRCs validated) | 5,121,158 | 5,243,331 | +2.39% |
 | Dhrystone (2000 runs) | 1,113,360 | 1,094,827 | −1.66% |
 | median | 4,159,515 | 4,209,243 | +1.20% |
 | SpMV, double precision | 99,142 | 99,017 | −0.13% |
 | SpMV, integer | 1,262,614 | 1,287,672 | +1.98% |
 | ptr_chase | 3,205,274 | 3,205,500 | +0.01% |
+| cache_sweep (2 MB cold + 4 KB hot) | 10,283,200 | 10,163,638 | −1.16% |
+| locality (96 KB cold + 4 KB hot) | 7,439,113 | 6,898,872 | −7.26% |
 | mem_contention (I$+D$ stress) | 4,334,798 | 4,554,375 | +5.07% |
 
 Branch mispredict counts match the RTL within 0.7% on every benchmark. Full details and the
@@ -500,13 +503,13 @@ measurements behind each calibration: `docs/BUGS.md` §B11–§B15.
 
 ### Known residual gaps (honestly stated, not yet closed)
 
-1. **FP:** dependent FP-add chains run about 0.8 cycles/op faster than RTL (fp_bench −3.5%,
-   fp_stress −4.8%); not a latency constant (`docs/BUGS.md` §B3).
+1. **FP residuals:** compare/convert → integer use and FP load → use are within ±5% on
+   microbenchmarks; fp_stress +3.2% (`docs/BUGS.md` §B16).
 2. **Divider timing:** the RTL makes a same-register divide wait for the previous one to commit
    but overlaps result use with that wait; the VP does the opposite and over-charges trivial
    divides (div_stress +1.7%, §B15).
-3. **I$/D$ miss overlap:** the VP serialises I$ and D$ misses more than the RTL
-   (mem_contention +5.1%, §B7). A hit right after a refill to the same line is also under-charged.
+3. **Misses interleaved with hits / I$+D$ overlap:** locality −7.3% with identical miss counts
+   (about 2 cycles per miss under-charged), mem_contention +5.1% (§B7, §B15, §B16).
 4. **No L2 cache.**
 
 #### Divider validation (vs CVA6 RTL co-simulation)

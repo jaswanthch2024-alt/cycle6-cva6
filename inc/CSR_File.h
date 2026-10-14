@@ -11,7 +11,7 @@ namespace riscv_tlm {
 // Privilege levels (RISC-V Privilege Spec 1.10)
 enum class PrivMode : uint8_t { U = 0, S = 1, M = 3 };
 
-// CSR addresses (Priv Spec 1.10 — subset needed for M+S+U Linux)
+// CSR addresses (Priv Spec 1.10: subset needed for M+S+U Linux)
 namespace CSR {
     // --- Machine Information ---
     static constexpr uint16_t MVENDORID  = 0xF11;
@@ -74,10 +74,10 @@ namespace MSTATUS {
     static constexpr uint64_t TVM  = (1ULL << 20);
     static constexpr uint64_t TW   = (1ULL << 21);
     static constexpr uint64_t TSR  = (1ULL << 22);
-    static constexpr uint64_t UXL  = (3ULL << 32); // bits 33:32 — U-mode XLEN (read-only, =2 for RV64)
-    static constexpr uint64_t SXL  = (3ULL << 34); // bits 35:34 — S-mode XLEN (read-only, =2 for RV64)
+    static constexpr uint64_t UXL  = (3ULL << 32); // bits 33:32, U-mode XLEN (read-only, =2 for RV64)
+    static constexpr uint64_t SXL  = (3ULL << 34); // bits 35:34, S-mode XLEN (read-only, =2 for RV64)
     static constexpr uint64_t SD   = (1ULL << 63);
-    // Writable mask for mstatus (RV64) — UXL/SXL are read-only, not included
+    // Writable mask for mstatus (RV64): UXL/SXL are read-only, not included
     static constexpr uint64_t WRITE_MASK =
         SIE | MIE | SPIE | MPIE | SPP | MPP | FS | MPRV | SUM | MXR | TVM | TW | TSR;
 }
@@ -120,7 +120,7 @@ public:
 
     PrivMode priv{PrivMode::M}; // Current privilege mode
 
-    // Read a CSR — returns value and sets access_ok=false on illegal access.
+    // Read a CSR: returns value and sets access_ok=false on illegal access.
     uint64_t read(uint16_t addr, bool& access_ok) {
         access_ok = true;
         // Privilege check: CSR addr[9:8] = minimum privilege required
@@ -162,7 +162,7 @@ public:
             // Machine counters
             case CSR::MCYCLE:     return mcycle;
             case CSR::MINSTRET:   return minstret;
-            // mhpmcounter3-31 (0xB03-0xB1F) — read-as-zero
+            // mhpmcounter3-31 (0xB03-0xB1F): read-as-zero
             case 0xB03: case 0xB04: case 0xB05: case 0xB06: case 0xB07:
             case 0xB08: case 0xB09: case 0xB0A: case 0xB0B: case 0xB0C:
             case 0xB0D: case 0xB0E: case 0xB0F: case 0xB10: case 0xB11:
@@ -201,7 +201,7 @@ public:
             case 0x002: return (fcsr >> 5) & 0x7;  // FRM
             case 0x003: return fcsr & 0xFF;        // FCSR
             default:
-                // Unknown CSR — illegal instruction
+                // Unknown CSR: illegal instruction
                 access_ok = false;
                 return 0;
         }
@@ -224,7 +224,7 @@ public:
             case CSR::MTVEC:      mtvec   = val & ~2ULL;        break; // mode bits [1:0]: 0=direct,1=vectored
             case CSR::MCOUNTEREN: mcounteren = val & 0xFFFFFFFF; break;
             case 0x30A: menvcfg = val; break;     // menvcfg
-            case 0x320: break;                    // mcountinhibit — silently ignore
+            case 0x320: break;                    // mcountinhibit: silently ignore
             // mhpmevent3-31
             case 0x323: case 0x324: case 0x325: case 0x326: case 0x327:
             case 0x328: case 0x329: case 0x32A: case 0x32B: case 0x32C:
@@ -232,14 +232,14 @@ public:
             case 0x332: case 0x333: case 0x334: case 0x335: case 0x336:
             case 0x337: case 0x338: case 0x339: case 0x33A: case 0x33B:
             case 0x33C: case 0x33D: case 0x33E: case 0x33F: break;
-            // mhpmcounter3-31 — silently ignore
+            // mhpmcounter3-31: silently ignore
             case 0xB03: case 0xB04: case 0xB05: case 0xB06: case 0xB07:
             case 0xB08: case 0xB09: case 0xB0A: case 0xB0B: case 0xB0C:
             case 0xB0D: case 0xB0E: case 0xB0F: case 0xB10: case 0xB11:
             case 0xB12: case 0xB13: case 0xB14: case 0xB15: case 0xB16:
             case 0xB17: case 0xB18: case 0xB19: case 0xB1A: case 0xB1B:
             case 0xB1C: case 0xB1D: case 0xB1E: case 0xB1F: break;
-            case 0x747: break;                    // mseccfg — silently ignore
+            case 0x747: break;                    // mseccfg: silently ignore
             case CSR::MSCRATCH:   mscratch = val; break;
             case CSR::MEPC:       mepc  = val & ~1ULL; break;
             case CSR::MCAUSE:     mcause = val; break;
@@ -264,7 +264,7 @@ public:
                 // Per RISC-V spec: unsupported mode writes are silently discarded.
                 uint64_t mode = val >> 60;
                 if (mode == 0 || mode == 8) satp = val;
-                // else: discard (kernel probe sees old value → falls back to supported mode)
+                // else: discard (kernel probe sees old value -> falls back to supported mode)
                 break;
             }
             case CSR::MCYCLE:     mcycle   = val; break;
@@ -288,7 +288,7 @@ public:
         return true;
     }
 
-    // Tick machine counters — called once per cycle.
+    // Tick machine counters: called once per cycle.
     void tick_counters(uint32_t num_retired) {
         mcycle++;
         minstret += num_retired;
@@ -304,7 +304,7 @@ public:
             sepc   = epc;
             stval  = tval;
             uint64_t spp_bit = (priv == PrivMode::S) ? MSTATUS::SPP : 0;
-            // Save SIE → SPIE, clear SIE, set SPP
+            // Save SIE -> SPIE, clear SIE, set SPP
             if (mstatus & MSTATUS::SIE) mstatus |=  MSTATUS::SPIE; else mstatus &= ~MSTATUS::SPIE;
             mstatus &= ~MSTATUS::SIE;
             mstatus  = (mstatus & ~MSTATUS::SPP) | spp_bit;
@@ -316,7 +316,7 @@ public:
             mepc   = epc;
             mtval  = tval;
             uint64_t mpp = static_cast<uint64_t>(priv) << 11;
-            // Save MIE → MPIE, clear MIE, set MPP
+            // Save MIE -> MPIE, clear MIE, set MPP
             if (mstatus & MSTATUS::MIE) mstatus |=  MSTATUS::MPIE; else mstatus &= ~MSTATUS::MPIE;
             mstatus &= ~MSTATUS::MIE;
             mstatus  = (mstatus & ~MSTATUS::MPP) | mpp;
@@ -360,8 +360,8 @@ public:
         if (pending == 0) return -1;
 
         bool m_enabled = (priv != PrivMode::M) || ((mstatus & MSTATUS::MIE) != 0);
-        // S-mode interrupts only fire in U-mode, or in S-mode with SIE=1.
-        // Per RISC-V spec: higher-privilege code (M-mode) is NEVER interrupted by S-mode signals.
+        // S-level interrupts are taken in U-mode, or in S-mode with SIE=1,
+        // never in M-mode (BUG-15).
         bool s_enabled = (priv == PrivMode::U) ||
                          (priv == PrivMode::S && (mstatus & MSTATUS::SIE) != 0);
 
@@ -476,7 +476,7 @@ public:
     }
 
     // Public register state (accessed directly by pipeline for performance).
-    // UXL=2 (RV64 U-mode), SXL=2 (RV64 S-mode) hardwired at reset per Privileged Spec §3.1.6
+    // UXL=2 (RV64 U-mode), SXL=2 (RV64 S-mode) hardwired at reset per Privileged Spec 3.1.6
     uint64_t mstatus{(2ULL << 32) | (2ULL << 34)};
     uint64_t misa{0};
     uint64_t medeleg{0};
@@ -512,7 +512,7 @@ private:
     static constexpr uint64_t SSTATUS_MASK =
         MSTATUS::UIE | MSTATUS::SIE | MSTATUS::UPIE | MSTATUS::SPIE |
         MSTATUS::SPP | MSTATUS::FS  | MSTATUS::XS   | MSTATUS::SUM  |
-        MSTATUS::MXR | MSTATUS::SD  | MSTATUS::UXL;  // UXL visible in sstatus per Privileged Spec §4.1.1
+        MSTATUS::MXR | MSTATUS::SD  | MSTATUS::UXL;  // UXL visible in sstatus per Privileged Spec 4.1.1
 
     static constexpr uint64_t MEDELEG_MASK = 0xB3FF; // delegatable exception bits
     static constexpr uint64_t MIDELEG_MASK = 0x0222; // delegatable interrupt bits (SSIP,STIP,SEIP)

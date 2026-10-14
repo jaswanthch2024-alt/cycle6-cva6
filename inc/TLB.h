@@ -12,11 +12,11 @@ namespace riscv_tlm {
 // Supports 4 KB (level=0), 2 MB (level=1), and 1 GB (level=2) pages.
 struct TLBEntry {
     bool     valid{false};
-    bool     global{false};  // PTE.G — not evicted by ASID-specific SFENCE.VMA
-    uint8_t  perm{0};        // PTE bits [4:1]: U(4) X(3) W(2) R(1) — shifted down by 1
+    bool     global{false};  // PTE.G: not evicted by ASID-specific SFENCE.VMA
+    uint8_t  perm{0};        // PTE bits [4:1]: U(4) X(3) W(2) R(1), shifted down by 1
     uint8_t  level{0};       // PTW depth at which leaf was found (0=4KB, 1=2MB, 2=1GB)
     uint16_t asid{0};
-    uint64_t vpn{0};         // VA[38:12] — full 27-bit VPN stored; matching uses level mask
+    uint64_t vpn{0};         // VA[38:12], full 27-bit VPN stored; matching uses level mask
     uint64_t ppn{0};         // Physical page number from PTE[53:10]
     uint64_t lru_time{0};
 };
@@ -57,27 +57,26 @@ public:
         entries[victim] = {true, global, perm, level, asid, vaddr >> 12, ppn, lru_clock};
     }
 
-    // SFENCE.VMA rs1=0, rs2=0 — flush all entries including global.
-    // Per RISC-V spec: rs1=0 rs2=0 means "flush entire TLB" — global entries are NOT exempt.
-    // Only ASID-specific flushes (rs2!=0) preserve global entries.
+    // SFENCE.VMA with rs1=rs2=0 flushes everything, global entries included
+    // (BUG-14). Only the ASID-specific forms keep global entries.
     void flush_all() {
         for (auto& e : entries) e.valid = false;
     }
 
-    // SFENCE.VMA rs1!=0, rs2=0 — flush all entries matching vaddr (any ASID).
+    // SFENCE.VMA rs1!=0, rs2=0: flush all entries matching vaddr (any ASID).
     void flush_va(uint64_t vaddr) {
         const uint64_t vpn = vaddr >> 12;
         for (auto& e : entries)
             if (e.valid && vpn_match(vpn, e.vpn, e.level)) e.valid = false;
     }
 
-    // SFENCE.VMA rs1=0, rs2!=0 — flush all entries matching ASID.
+    // SFENCE.VMA rs1=0, rs2!=0: flush all entries matching ASID.
     void flush_asid(uint16_t asid) {
         for (auto& e : entries)
             if (e.valid && !e.global && e.asid == asid) e.valid = false;
     }
 
-    // SFENCE.VMA rs1!=0, rs2!=0 — flush entry matching both vaddr and ASID.
+    // SFENCE.VMA rs1!=0, rs2!=0: flush entry matching both vaddr and ASID.
     void flush_va_asid(uint64_t vaddr, uint16_t asid) {
         const uint64_t vpn = vaddr >> 12;
         for (auto& e : entries)
@@ -96,8 +95,8 @@ private:
 
     // Returns true if vpn matches stored_vpn at the given superpage level.
     // Level 0: full 27-bit VPN match (4 KB pages)
-    // Level 1: match upper 18 bits — VPN[2:1] (2 MB superpages, ignore VPN[0])
-    // Level 2: match upper  9 bits — VPN[2]   (1 GB superpages, ignore VPN[1:0])
+    // Level 1: match upper 18 bits, VPN[2:1] (2 MB superpages, ignore VPN[0])
+    // Level 2: match upper  9 bits, VPN[2]   (1 GB superpages, ignore VPN[1:0])
     static bool vpn_match(uint64_t vpn, uint64_t stored_vpn, uint8_t level) {
         const int shift = static_cast<int>(level) * 9; // 0, 9, or 18
         return (vpn >> shift) == (stored_vpn >> shift);

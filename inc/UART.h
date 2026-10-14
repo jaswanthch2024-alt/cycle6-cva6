@@ -23,12 +23,12 @@ namespace riscv_tlm { namespace peripherals {
 // TX: writes go to std::cout.
 // RX: a background thread reads raw bytes from stdin and pushes them into a
 //     software FIFO.  An SC_THREAD (rx_monitor_process) fires the RDA interrupt
-//     into the PLIC every 50 µs of simulation time when unread data is waiting.
+//     into the PLIC every 50 us of simulation time when unread data is waiting.
 //
 // 4-byte stride offsets (reg-shift=2):
 //   0x00 RBR/THR/DLL  0x04 IER/DLM  0x08 IIR/FCR  0x0C LCR
 //   0x10 MCR          0x14 LSR       0x18 MSR       0x1C SCR
-// 1-byte stride offsets: 0x0–0x7 map directly.
+// 1-byte stride offsets: 0x0-0x7 map directly.
 
 class UART : public sc_core::sc_module {
 public:
@@ -65,7 +65,7 @@ private:
     uint8_t m_ier;
     bool    m_thre_ip;
 
-    // RX FIFO — written by stdin thread, read by SystemC thread via b_transport.
+    // RX FIFO: written by stdin thread, read by SystemC thread via b_transport.
     std::mutex          rx_mutex;
     std::deque<uint8_t> rx_fifo;
 
@@ -87,13 +87,13 @@ private:
         if (set_uart_irq) set_uart_irq(thre_active || rda_active);
     }
 
-    // Peek at FIFO size under lock — used only inside SystemC thread.
+    // Peek at FIFO size under lock: used only inside SystemC thread.
     bool rx_fifo_empty_locked() {
         std::lock_guard<std::mutex> lk(rx_mutex);
         return rx_fifo.empty();
     }
 
-    // Pop one byte under lock — used only inside SystemC thread.
+    // Pop one byte under lock: used only inside SystemC thread.
     uint8_t rx_pop() {
         std::lock_guard<std::mutex> lk(rx_mutex);
         uint8_t b = rx_fifo.front();
@@ -103,7 +103,7 @@ private:
 
     // -------------------------------------------------------------------------
     // SC_THREAD: periodically assert RDA interrupt when unread bytes are waiting.
-    // Runs every 50 µs of simulation time (~5000 cycles at 100 MHz).
+    // Runs every 50 us of simulation time (~5000 cycles at 100 MHz).
     // -------------------------------------------------------------------------
 
     void rx_monitor_process() {
@@ -216,7 +216,7 @@ private:
                         update_interrupts();
                     }
                     break;
-                case 2: break; // FCR (write-only) — ignore
+                case 2: break; // FCR (write-only): ignore
                 case 3: dlab = (val >> 7) & 1; break; // LCR
                 case 7: scr = val; break;              // SCR
                 default: break;
@@ -231,7 +231,7 @@ private:
                     }
                     break;
                 case 1: val = m_ier; break; // IER
-                case 2: // IIR — report highest-priority pending interrupt
+                case 2: // IIR: report highest-priority pending interrupt
                     {
                         bool rda  = (m_ier & 0x01) && !rx_fifo_empty_locked();
                         bool thre = (m_ier & 0x02) && m_thre_ip;
@@ -250,8 +250,8 @@ private:
                 case 4: val = 0;    break; // MCR
                 case 5: // LSR
                     {
-                        uint8_t lsr = 0x60; // THRE(5)=1, TEMT(6)=1 — TX always ready
-                        if (!rx_fifo_empty_locked()) lsr |= 0x01; // DR — data ready
+                        uint8_t lsr = 0x60; // THRE(5)=1, TEMT(6)=1: TX always ready
+                        if (!rx_fifo_empty_locked()) lsr |= 0x01; // DR: data ready
                         val = lsr;
                     }
                     break;

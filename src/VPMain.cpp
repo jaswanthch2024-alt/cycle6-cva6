@@ -203,8 +203,8 @@ int sc_main(int argc, char* argv[]) {
     if (opts.max_instructions > 0) {
         auto* cpu64 = dynamic_cast<riscv_tlm::CPURV64P6_Cycle*>(g_top->cpu);
         auto* cpu32 = dynamic_cast<riscv_tlm::CPURV32P6_Cycle*>(g_top->cpu);
-        // Cap trace buffer at 1M entries (~72 MB) — storing 4×max_instructions
-        // would OOM for large runs (e.g. 40M instr → 11.5 GB).
+        // Cap trace buffer at 1M entries (~72 MB): storing 4xmax_instructions
+        // would OOM for large runs (e.g. 40M instr -> 11.5 GB).
         constexpr size_t MAX_TRACE = 1000000;
         size_t lim = std::min(static_cast<size_t>(opts.max_instructions) * 4, MAX_TRACE);
         if (cpu64) cpu64->trace_limit = lim;
@@ -261,7 +261,7 @@ int sc_main(int argc, char* argv[]) {
 
                     // Diagnostic block below fires mid-stream, while the UART
                     // console is still actively emitting characters for the
-                    // shell prompt — printing here interleaves with that live
+                    // shell prompt: printing here interleaves with that live
                     // output and garbles the terminal. Gate it behind an env
                     // var so a "clean" boot (just the Linux console log) is
                     // the default; set VP_BOOT_STATS=1 to restore it.
@@ -305,7 +305,7 @@ int sc_main(int argc, char* argv[]) {
     }
 
     // Use a fine-grained quantum when an instruction limit is set so the check fires promptly.
-    // At 100 MHz (10 ns/cycle), 10 µs = ~1000 cycles per quantum — well below any practical limit.
+    // At 100 MHz (10 ns/cycle), 10 us = ~1000 cycles per quantum: well below any practical limit.
     const sc_core::sc_time quantum = (opts.max_instructions > 0)
         ? sc_core::sc_time(10, sc_core::SC_US)
         : sc_core::sc_time(1, sc_core::SC_MS);

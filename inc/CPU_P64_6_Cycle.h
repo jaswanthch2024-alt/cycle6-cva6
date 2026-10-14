@@ -1,10 +1,9 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 /**
  * @file CPU_P64_6_Cycle.h
- * @brief 6-Stage Pipelined RISC-V 64-bit CPU - Cycle-Accurate Timing Model
- * 
- * Pipeline Stages:
- *   PC -> IF -> ID -> IS -> EX -> MEM -> WB
+ * @brief Cycle6: six-stage RV64 pipeline model of CVA6
+ *
+ * Stages: PCGen -> Fetch -> (4-entry fetch queue) -> ID -> Issue -> EX -> Commit
  */
 #pragma once
 #ifndef CPU_P64_6_CYCLE_H
@@ -74,22 +73,22 @@ public:
         // Diagnostic split of branch_mispredicts by kind (EX + ID sites)
         uint64_t mp_cond{0}, mp_jal{0}, mp_ret{0}, mp_jalr{0}, mp_alias{0};
         uint64_t flushes{0};
-        uint64_t forwarded_reads{0};     // Phase 1: RAW hazards resolved by forwarding
-        uint64_t load_store_forwards{0}; // Phase 2: Loads satisfied from store buffer
-        uint64_t mul_stall_cycles{0};    // Phase 3: Cycles MUL FU was busy (not idle)
-        uint64_t div_stall_cycles{0};    // Phase 3: Cycles DIV FU was busy (not idle)
-        uint64_t icache_misses{0};       // Phase 4: I$ miss count
-        uint64_t icache_miss_cycles{0};  // Phase 4: Cycles stalled on I$ miss
-        uint64_t dcache_misses{0};       // Phase 4: D$ miss count
-        uint64_t dcache_miss_cycles{0};  // Phase 4: Cycles stalled on D$ miss
-        uint64_t load_use_stall_cycles{0}; // Cycles stalled on 1-cycle load-use hazard
-        uint64_t itlb_miss_cycles{0};    // Phase 8: Cycles stalled on ITLB miss + PTW
-        uint64_t dtlb_miss_cycles{0};    // Phase 8: Cycles stalled on DTLB miss + PTW
-        uint64_t m_instrs{0};            // Instructions committed in M-mode
-        uint64_t s_instrs{0};            // Instructions committed in S-mode
-        uint64_t u_instrs{0};            // Instructions committed in U-mode
-        uint64_t dual_commits{0};        // Cycles where 2 instructions committed (dual-issue)
-        uint64_t load_addr_events{0};    // §B9: load->address dependency bubbles charged
+        uint64_t forwarded_reads{0};     // operands taken from the forwarding path
+        uint64_t load_store_forwards{0}; // loads served from the store buffer
+        uint64_t mul_stall_cycles{0};    // cycles the multiplier was busy
+        uint64_t div_stall_cycles{0};    // cycles the divider was busy
+        uint64_t icache_misses{0};
+        uint64_t icache_miss_cycles{0};
+        uint64_t dcache_misses{0};
+        uint64_t dcache_miss_cycles{0};
+        uint64_t load_use_stall_cycles{0}; // cycles with a D$-hit load still in flight
+        uint64_t itlb_miss_cycles{0};    // nominal PTW cycles, not necessarily stalled (AXI build)
+        uint64_t dtlb_miss_cycles{0};
+        uint64_t m_instrs{0};            // committed per privilege mode
+        uint64_t s_instrs{0};
+        uint64_t u_instrs{0};
+        uint64_t dual_commits{0};        // cycles that committed two instructions
+        uint64_t load_addr_events{0};    // load->address bubbles charged (BUGS.md B9)
 
         double get_cpi() const { return instructions > 0 ? (double)cycles / instructions : 0; }
         double get_ipc() const { return cycles > 0 ? (double)instructions / cycles : 0; }
@@ -100,7 +99,7 @@ public:
     void printStats() const;
     void dumpPipelineTrace(const std::string& filename) const;
 
-    size_t trace_limit{100000};  // Max cycles to record — settable before sc_start()
+    size_t trace_limit{100000};  // Max cycles to record: settable before sc_start()
     size_t trace_idx{0};         // Circular trace buffer index
     peripherals::CLINT* clint_ptr{nullptr};  // for WFI fast-forward
     Registers<BaseType>*    register_bank{nullptr};
@@ -135,12 +134,10 @@ private:
     sc_core::sc_time clock_period{10, sc_core::SC_NS};
 
     // =========================================================================
-    // Pipeline Latches
+    // Pipeline latches. Each stage writes *_next; the clock edge in
+    // cycle_thread copies it to the *_reg the next stage reads.
     // =========================================================================
-    
-    // --- Pipeline Latches ---
-    // These structures hold the state transferred between pipeline stages on each clock cycle.
-    
+
     // PCGen -> Fetch Latch
     // Holds the next program counter to be fetched.
     struct PCGen_Fetch_Latch {
@@ -217,11 +214,8 @@ private:
         bool is_ras_return{false};
     } issue_ex_reg, issue_ex_next;
 
-    // EX -> Commit (ROB/Architectural Update Interface)
-    // Conceptually, EX writes to ROB. Commit reads from ROB.
-    // We can use a latch to simulate the "Writeback" port to ROB if needed, 
-    // or just let EX update ROB directly.
-    // For this model, EX will write to ROB, and Commit will retire from ROB.
+    // There is no EX -> Commit latch: EX writes results into the scoreboard
+    // and Commit retires from there.
 
     // =========================================================================
     // Control & State
@@ -232,7 +226,7 @@ private:
     bool stall_pcgen{false};
     bool stall_fetch{false};
     bool stall_issue{false};
-    bool stall_ex{false};     // EX replay: partial store-buffer overlap → retry next cycle
+    bool stall_ex{false};     // EX replay: partial store-buffer overlap -> retry next cycle
     
     // Flush Signal (e.g. for Branch Misprediction)
     bool flush_pipeline{false};
@@ -244,10 +238,12 @@ private:
     // BTB redirect latency). Set when PCGen predicts taken; consumed as a bubble
     // on the next PCGen cycle.
     bool taken_redirect_bubble{false};
+    // Set together with flush_pipeline only for branch/jump mispredicts, so
+    // the redirect bubble isn't charged on traps (BUGS.md B6).
     bool flush_is_branch_mispredict{false};
-  int mul_waw_rd{-1}; // rd of a multiply that completed this cycle (WAW bubble, BUGS §B12) // set with flush_pipeline only for branch/jump mispredicts (B6 bubble scope)
+  int mul_waw_rd{-1}; // rd of a multiply that completed this cycle (WAW bubble, BUGS.md B12)
  
-    // Scoreboard — unified issue FIFO + reorder buffer + rd_clobber (CVA6-aligned).
+    // Scoreboard: unified issue FIFO + reorder buffer + rd_clobber (CVA6-aligned).
     // Replaces the separate bool scoreboard[32] and ReorderBuffer<32> rob.
     Scoreboard<32> scoreboard;
 
@@ -255,35 +251,25 @@ private:
     uint32_t commit_count_this_cycle{0};
     uint64_t committed_pc_this_cycle{0};
 
-    // =========================================================================
-    // Branch Prediction Structures (CVA6-Aligned)
-    // =========================================================================
+    // Legacy VP predictor, only used with VP_BP=legacy: tagged 32-entry BTB
+    // and 128-entry BHT indexed by PC[6:2] / PC[8:2], 2-entry RAS.
     struct BTBEntry {
         uint64_t target{0};
-        uint64_t tag{0};    // Full PC tag to prevent aliasing
+        uint64_t tag{0};       // full PC
         bool valid{false};
-        bool is_return{false}; // Metadata to identify return instructions for RAS
+        bool is_return{false};
     };
-    
-    // Direct-mapped BTB, 128 entries (indexed by PC[8:2])
     BTBEntry btb[32];
-
-    // Branch History Table (BHT), 256 entries of 2-bit saturating counters
-    // State: 00 (Strongly Not Taken), 01 (Weakly Not Taken)
-    //        10 (Weakly Taken),       11 (Strongly Taken)
-    // Indexed by PC[9:2]
-    uint8_t bht[128]; 
-
-    // Return Address Stack (RAS), 4-entry LIFO
+    uint8_t bht[128];          // 2-bit counters, 0..1 not taken, 2..3 taken
     std::vector<uint64_t> ras;
 
-    // CVA6-faithful predictor (VP_BP=cva6), from cva6/core/frontend/:
-    // instr_scan decodes the fetched instruction; jal always taken; branches
-    // use a BHT (valid bit + 2-bit counter, reset 00, pc[7:1]) or the static
-    // backward-taken rule, target from the immediate; returns use a 2-entry
-    // RAS that is never flushed; other jalr use a tagless BTB (pc[5:1]).
-    // bht.sv resets every entry to '0 (valid=0, counter=00); the 2'b10 seen in the
-    // flush branch is unreachable because the frontend ties flush_bp_i to 0.
+    // Default predictor: CVA6's frontend rules (cva6/core/frontend/).
+    // instr_scan decodes the fetched instruction; jal is always taken;
+    // branches use the BHT (valid bit + 2-bit counter, reset 00, PC[7:1]) or,
+    // when the entry is invalid, backward-taken; returns use a 2-entry RAS that
+    // is never flushed; other jalr use a tagless 32-entry BTB (PC[5:1]).
+    // bht.sv has a 2'b10 reset value in its flush branch, but the frontend ties
+    // flush_bp_i to 0, so entries really start at 00.
     struct Cva6Bht { bool valid{false}; uint8_t ctr{0}; };
     struct Cva6Btb { bool valid{false}; uint64_t target{0}; };
     struct Cva6Ras { bool valid{false}; uint64_t ra{0}; };
@@ -294,10 +280,6 @@ private:
     bool cva6_predict(uint64_t pc, uint32_t instr, bool is_c, uint64_t &target);
     bool fetch_fault_nonspeculative() const;
     static bool cva6_is_return(uint32_t instr, bool is_c);
-
-    // =========================================================================
-    // Statistics (Moved to public section)
-    // =========================================================================
 
     // =========================================================================
     // Pipeline Trace (for visualization)
@@ -324,27 +306,24 @@ private:
     std::vector<PipelineTraceEntry> pipeline_trace;
 
     // =========================================================================
-    // Out-of-Order Execution Components
+    // Execution units and buffers
     // =========================================================================
 
-    // Store buffer: 4 speculative + 4 committed entries (CVA6-aligned split design).
-    StoreBuffer<4, 4> store_buffer;
+    StoreBuffer<4, 4> store_buffer;   // 4 speculative + 4 committed, as in CVA6
 
-    // Multi-cycle functional unit state (Phase 3).
-    // Each FU operates independently — only data-dependent instructions stall
-    // via the scoreboard rd_clobber mechanism.
+    // A multi-cycle unit holding one in-flight result. Dependent instructions
+    // wait through the scoreboard; independent ones keep issuing.
     struct FunctionalUnitState {
         bool     busy{false};
-        int      remaining{0};   // Cycles left before scoreboard.complete() is called
+        int      remaining{0};   // cycles until scoreboard.complete()
         uint64_t result{0};
         int      trans_id{-1};
         uint8_t  rd{0};
     };
-    FunctionalUnitState mul_fu;        // 2-cycle multiplier   (MUL/MULH/MULHU/MULHSU/MULW)
-    FunctionalUnitState div_fu;        // 64-cycle divider     (DIV/DIVU/REM/REMU/DIVW/…)
-    // Pipelined FPU (CVA6 FPnew-aligned): throughput 1 op/cycle, latency 2–5.
-    // Independent FP ops overlap; only dependent consumers stall via the
-    // scoreboard. Backed by a small array of in-flight result slots.
+    FunctionalUnitState mul_fu;        // 2-cycle multiplier
+    FunctionalUnitState div_fu;        // serial divider, operand-dependent latency
+    // FPnew add/mul/fma/convert ops: one issue per cycle, latency 1-4 cycles
+    // (tables in F_extension.h / D_extension.h). One slot per op in flight.
     static constexpr int FPU_SLOTS = 8;
     FunctionalUnitState fpu_pipe[FPU_SLOTS];
     bool fpu_pipe_full() const {
@@ -353,24 +332,18 @@ private:
     }
     bool fpu_any_busy() const {
         for (int i = 0; i < FPU_SLOTS; i++) if (fpu_pipe[i].busy) return true;
-        return fpu_divsqrt_fu.busy;
+        return fpu_divsqrt_fu.busy || fpu_divsqrt_hold.busy;
     }
-    // FP divide/sqrt: iterative, NON-pipelined (like CVA6 FPnew's DIVSQRT block).
-    // Blocking single unit — a second FP div/sqrt waits for the first.
+    // FP div/sqrt is not pipelined. While it runs, add/mul keep issuing; a
+    // second div/sqrt waits in the one-entry hold register (fpu_wrap.sv).
     FunctionalUnitState fpu_divsqrt_fu;
-    // Variable-latency LSU (D$ miss deferred completion). Multi-slot so a
-    // second independent load's miss latency can overlap the first, matching
-    // CVA6's NrLoadBufEntries=2. Under AXI (single DCACHE master) only slot 0
-    // is ever used, preserving the existing AXI arbiter behaviour unchanged.
-    //
-    // dcache_miss_slots_active is runtime-settable (VP_DCACHE_SLOTS env var, see
-    // CPU_P64_6_Cycle.cpp) for side-by-side "what if the D$ were non-blocking like
-    // CVA6's HPDcache option" experiments ONLY -- the RTL-accurate default (1 with
-    // AXI, 2 without) mirrors the WT cache's single-MSHR blocking behaviour. A
-    // higher slot count is a directional experiment, not an RTL-accuracy claim
-    // (HPDcache's real MSHR capacity is 64 sets x 2 ways = up to 128 outstanding
-    // misses; MAX_DCACHE_MISS_SLOTS is capped far below that as a practical
-    // array bound, not a claim of matching HPDcache exactly).
+    FunctionalUnitState fpu_divsqrt_hold;
+    // VP_FPU_LEGACY_BLOCK=1: old model, every FPU op waits for div/sqrt.
+    static bool fpu_legacy_block() { static const bool v = [] { const char *e = std::getenv("VP_FPU_LEGACY_BLOCK"); return e && *e == '1'; }(); return v; }
+    // Outstanding D$ misses. The WT D$ has a single MSHR (mshr_q), so the AXI
+    // build defaults to one slot. VP_DCACHE_SLOTS allows more as an experiment
+    // only: all slots share one AXI request channel, so this is not a model of
+    // a multi-entry MSHR and it is not validated against RTL.
     static constexpr int MAX_DCACHE_MISS_SLOTS = 8;
 #ifdef ENABLE_AXI_CONTENTION
     static constexpr int DCACHE_MISS_SLOTS_DEFAULT = 1;
@@ -380,19 +353,13 @@ private:
     int dcache_miss_slots_active{DCACHE_MISS_SLOTS_DEFAULT};
     FunctionalUnitState dcache_miss_fu[MAX_DCACHE_MISS_SLOTS];
 
-    // Opt-in D$ address trace dump (VP_DCACHE_TRACE=<path> env var, see
-    // constructor) -- one address per line, for offline cache-geometry
-    // sweep tools (tools/cache_sweep/) to replay against swept configs.
-    // Purely a diagnostic sink: never read back by the VP itself, zero
-    // effect on simulation behaviour when unset (the default).
+    // VP_DCACHE_TRACE=<file> / VP_ICACHE_TRACE=<file> write every D$ address
+    // or fetch PC, one per line, for tools/cache_sweep/. Output only.
     std::FILE* dcache_trace_file{nullptr};
     void trace_dcache_access(uint64_t addr) {
         if (dcache_trace_file) std::fprintf(dcache_trace_file, "%lx\n", (unsigned long)addr);
     }
 
-    // Same idea, I$ side (VP_ICACHE_TRACE=<path> env var) -- every fetch
-    // PC, for an I$-geometry exploration tool mirroring tools/cache_sweep/.
-    // Same purely-diagnostic sink, zero effect when unset.
     std::FILE* icache_trace_file{nullptr};
     void trace_icache_access(uint64_t addr) {
         if (icache_trace_file) std::fprintf(icache_trace_file, "%lx\n", (unsigned long)addr);
@@ -409,10 +376,9 @@ private:
         for (int i = 0; i < dcache_miss_slots_active; i++) if (!dcache_miss_fu[i].busy) return i;
         return -1;
     }
-    // D$-hit / store-buffer-forward load latency, as a small pipeline so loads can
-    // issue every cycle (CVA6's load unit is pipelined). Slots = load_hit_penalty:
-    // at the default (1) this is the original single-slot unit, bit-identical.
-    // VP_LOAD_LAT=N raises the hit latency (see docs/BUGS.md §B11).
+    // Loads that hit the D$ or forward from the store buffer. CVA6's hit
+    // latency is 3 cycles but pipelined, so this is a small pipeline with one
+    // slot per cycle of extra latency (load_hit_penalty, VP_LOAD_LAT; BUGS.md B11).
     static constexpr int LOAD_HIT_SLOTS = 4;
     FunctionalUnitState load_hit_pipe[LOAD_HIT_SLOTS];
     int load_hit_slots_active{2};
@@ -452,14 +418,10 @@ private:
     std::vector<FetchQueueEntry> fetch_queue;
     static constexpr size_t FETCH_QUEUE_CAPACITY{4};
 
-    // L1 cache instances (Phase 4).
-    // Geometry matched to CVA6 cv64a6_imafdc_sv39 (Icache/DcacheLineWidth = 128 b
-    // = 16 B lines, 256 sets):
-    //   I$: 16 KB, 4-way, 16 B lines  (256 sets × 4 ways × 16 B)
-    //   D$: 32 KB, 8-way, 16 B lines  (256 sets × 8 ways × 16 B)
-    // D$ geometry is overridable at build time for line-width / bus-width
-    // experiments (e.g. -DVP_DCACHE_LINE_BYTES=128 -DVP_DCACHE_SETS=32 keeps
-    // 32 KB). Defaults are the CVA6 values above.
+    // L1 geometry of cv64a6_imafdc_sv39 (128-bit = 16 B lines, 256 sets):
+    // I$ 16 KB 4-way, D$ 32 KB 8-way. D$ sets and line size can be overridden
+    // at build time, e.g. -DVP_DCACHE_LINE_BYTES=128 -DVP_DCACHE_SETS=32
+    // keeps 32 KB.
 #ifndef VP_DCACHE_SETS
 #define VP_DCACHE_SETS 256
 #endif
@@ -470,47 +432,40 @@ private:
     Cache<VP_DCACHE_SETS, 8, VP_DCACHE_LINE_BYTES> dcache;
 
 #ifdef ENABLE_AXI_CONTENTION
-    // Real matchlib AxiArbiter I$/D$ contention subsystem (CYCLE6_AXI build).
-    // Constructed in set_clock() once the sc_clock is known. Miss latency is
-    // produced by the arbiter+slave instead of the flat software counters.
+    // matchlib AXI arbiter shared by I$ and D$ refills (CYCLE6_AXI builds).
+    // Built in set_clock() because it needs the clock. Timing only; the data
+    // still goes over TLM.
     riscv_axi::AxiContentionTop* axi_top{nullptr};
-    bool icache_axi_pending{false}; // an I$ refill is in flight through the arbiter
-    int  axi_slave_latency{0};      // Re-derived for genuine 2-beat AXI burst reads (was 1, single-beat): see docs/BUGS.md §B10
+    bool icache_axi_pending{false}; // I$ refill in flight
+    int  axi_slave_latency{0};      // fitted to the RTL co-sim for 2-beat bursts
 #endif
 
-    int icache_miss_remaining{0}; // Cycles until current I$ miss resolves
-    // Per-line refill latency for a 16 B line over the co-sim's AXI path
-    // (zero-wait-state SlaveFromFile memory). Measured from a streaming benchmark
-    // at ~9.5 cyc/line. NOTE: calibrated to the co-sim testbench memory, not to a
-    // real DRAM hierarchy — re-derive if a timed memory model is introduced.
-    int icache_miss_penalty{7};    // Re-derived vs RTL: see docs/BUGS.md §B10 (was 10)
-    int dcache_miss_penalty{10};   // Settable before sc_start()
-    int store_drain_remaining{0};  // Active write-through store cycles remaining
-    int store_write_penalty{0};   // 0-cycle write-back store drain latency
-    int load_hit_penalty{2};       // D$-hit load-use stall: RTL hit latency is 3 cycles, pipelined (§B11)
-    // Extra cycles when a load result feeds a subsequent load/store ADDRESS
-    // (gather / pointer-chase). CVA6 routes a load result to address-generation
-    // ~2 cycles slower than to an ALU op; the VP under-charged this. Measured
-    // with a pure pointer-chase (+2.0 cyc/dependent-load). See docs/BUGS.md §B9.
-    // Set 0 to disable (reverts to the old load->ALU==load->address behaviour).
+    int icache_miss_remaining{0};
+    // Fixed miss penalties, used only by the non-AXI build. Fitted to the
+    // co-sim's zero-wait-state memory, not to real DRAM.
+    int icache_miss_penalty{7};
+    int dcache_miss_penalty{10};
+    int store_drain_remaining{0};
+    int store_write_penalty{0};    // stores drain to the WT D$ with no stall
+    int load_hit_penalty{2};       // extra cycles on a D$ hit: RTL hit latency is 3, pipelined (BUGS.md B11)
+    // A load result that feeds a later load/store address costs about 2 more
+    // cycles in CVA6 than one feeding an ALU op (measured on a pointer chase,
+    // BUGS.md B9). 0 turns it off.
     int load_addr_penalty{2};
-    uint32_t reg_load_tainted{0};  // per-reg taint: value derives (via address
-                                   // arithmetic) from a recent load result (§B9)
-    int      load_addr_extra{0};   // countdown of pending load->address stall cycles
-    uint64_t diag_costall_cycles{0}; // TEMP DIAGNOSTIC: cycles where I$ miss AND D$ miss both active
-    uint64_t diag_zero_commit_cycles{0}; // TEMP DIAGNOSTIC: cycles with 0 instructions committed
-    uint64_t diag_if_empty_cycles{0}; // TEMP DIAGNOSTIC: fetch_queue empty when Issue wants to pop (RTL if_empty equivalent)
-    uint64_t diag_stall_run_len{0};      // TEMP: current consecutive zero-commit run length
-    uint64_t diag_stall_run_count{0};    // TEMP: number of completed stall runs
-    uint64_t diag_stall_run_sum{0};      // TEMP: sum of all completed run lengths
-    uint64_t diag_stall_run_max{0};      // TEMP: longest single stall run
+    uint32_t reg_load_tainted{0};  // bit per register: value came from a recent load
+    int      load_addr_extra{0};   // remaining load->address stall cycles
+    // Diagnostic counters, printed with the statistics; no effect on timing.
+    uint64_t diag_costall_cycles{0};     // I$ and D$ miss both active
+    uint64_t diag_zero_commit_cycles{0};
+    uint64_t diag_if_empty_cycles{0};    // fetch queue empty when ID wants an instruction
+    uint64_t diag_stall_run_len{0};      // zero-commit runs: current length,
+    uint64_t diag_stall_run_count{0};    // count,
+    uint64_t diag_stall_run_sum{0};      // total length
+    uint64_t diag_stall_run_max{0};      // and longest
 
-    // CSR file — M+S+U privilege support (Phase 5/6/7).
-    CSR_File csr;
+    CSR_File csr;                  // M, S and U mode CSRs
 
-    // sv39 MMU — ITLB + DTLB + page table walker (Phase 8/9).
-    // Initialized in constructor after mem_intf is ready.
-    MMU* mmu{nullptr};
+    MMU* mmu{nullptr};             // sv39: ITLB, DTLB, page-table walker; created in the constructor
 
     // Pending trap from EX stage: if valid, PCGen redirects and flushes.
     bool     trap_pending{false};

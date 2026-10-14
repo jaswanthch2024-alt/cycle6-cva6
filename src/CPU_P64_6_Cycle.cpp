@@ -25,26 +25,22 @@ CPURV64P6_Cycle::CPURV64P6_Cycle(sc_core::sc_module_name const &name,
                                  BaseType PC, bool debug)
     : CPU(name, debug) {
 
-  // Initialize Register Bank and Memory Interface
   register_bank = new Registers<BaseType>();
   mem_intf = new MemoryInterface();
 
-  // Set Initial State
   register_bank->setPC(PC);
   // Initialize Stack Pointer (SP) to the top of memory (minus 8 bytes for
   // alignment)
   register_bank->setValue(Registers<BaseType>::sp, Memory::SIZE - 8);
   // Initialize Global Pointer (GP) for bare-metal global variables
-  // GP = 0x10FF3: places buffer (gp-2035) at 0x10800 — 4-byte aligned, above
+  // GP = 0x10FF3: places buffer (gp-2035) at 0x10800, 4-byte aligned, above
   // .text end (0x10722)
   register_bank->setValue(Registers<BaseType>::gp, 0x10FF3);
   int_cause = 0;
 
-  // Register callback for DMI invalidations from the bus
   instr_bus.register_invalidate_direct_mem_ptr(this,
                                                &CPU::invalidate_direct_mem_ptr);
 
-  // Initialize ISA Extensions
   base_inst = new BASE_ISA<BaseType>(0, register_bank, mem_intf);
   a_inst = new A_extension<BaseType>(0, register_bank, mem_intf);
   c_inst = new C_extension<BaseType>(0, register_bank, mem_intf);
@@ -72,28 +68,18 @@ CPURV64P6_Cycle::CPURV64P6_Cycle(sc_core::sc_module_name const &name,
     logger->info("VP_DMISS_EXTRA={}: D$ miss fill-tail override", dmiss_extra);
   }
   // Branch predictor rules: default = CVA6's frontend rules (cva6_predict(),
-  // docs/BUGS.md §B13); VP_BP=legacy restores the original VP predictor.
+  // docs/BUGS.md B13); VP_BP=legacy restores the original VP predictor.
   if (const char *bp = std::getenv("VP_BP")) {
     bp_cva6 = (std::string(bp) != "legacy");
     if (!bp_cva6) logger->info("VP_BP=legacy: original VP predictor (non-default)");
   }
 
-  // Cache replacement policy: LFSR (CVA6-accurate) by default. Set
-  // VP_CACHE_POLICY=LRU|MRU|PLRU|NRU|LFU to switch both L1 caches for
-  // side-by-side comparison only -- none of these are a second
-  // RTL-accurate mode (real CVA6 always uses LFSR). See inc/Cache.h for
-  // why a fair LRU-vs-LFSR comparison needs workloads with genuine
-  // temporal locality, not just large sequential scans (which are LRU's
-  // textbook worst case).
-  // VP_ICACHE_POLICY / VP_DCACHE_POLICY override VP_CACHE_POLICY for one
-  // cache only, so I$ and D$ policy can be swept independently (e.g. pin
-  // D$ at LFSR while sweeping I$, to isolate the I$-only effect instead of
-  // changing both caches at once).
+  // Replacement policy, LFSR by default as in CVA6. VP_CACHE_POLICY sets both
+  // caches to LRU/MRU/PLRU/NRU/LFU for comparison; VP_ICACHE_POLICY and
+  // VP_DCACHE_POLICY set one cache only.
   {
-    // icache/dcache are different Cache<> template instantiations (4-way
-    // vs 8-way), so each has its OWN distinct Policy enum type even though
-    // the enumerators are named identically -- resolve each cache's
-    // policy independently rather than sharing one enum value.
+    // The two caches are different template instances, so their Policy enums
+    // are different types and have to be looked up separately.
     auto policy_for = [&](auto &cache, const std::string &name) {
       using Pol = typename std::decay_t<decltype(cache)>::Policy;
       if (name == "LRU") { cache.set_policy(Pol::LRU); return true; }
@@ -116,13 +102,8 @@ CPURV64P6_Cycle::CPURV64P6_Cycle(sc_core::sc_module_name const &name,
     }
   }
 
-  // D$ outstanding-miss slots: DCACHE_MISS_SLOTS_DEFAULT (RTL-accurate, matches
-  // the WT cache's single-MSHR blocking behaviour) by default. Set
-  // VP_DCACHE_SLOTS=N (up to MAX_DCACHE_MISS_SLOTS) to model a non-blocking D$
-  // with more concurrent outstanding misses in flight, for side-by-side
-  // comparison only -- this is NOT an RTL-accurate mode for the WT config we
-  // validate against (real CVA6 would need the HPDcache option, a structurally
-  // different cache, to get this concurrency -- see docs/BUGS.md §B7).
+  // VP_DCACHE_SLOTS: more outstanding D$ misses, as an experiment. The WT
+  // D$ has one MSHR; more would need CVA6's HPDcache (BUGS.md B7).
   if (const char *slots = std::getenv("VP_DCACHE_SLOTS")) {
     int n = std::atoi(slots);
     if (n < 1) n = 1;
@@ -131,9 +112,7 @@ CPURV64P6_Cycle::CPURV64P6_Cycle(sc_core::sc_module_name const &name,
     logger->info("VP_DCACHE_SLOTS={}: D$ outstanding-miss slots overridden (non-RTL-accurate unless ={})", n, DCACHE_MISS_SLOTS_DEFAULT);
   }
 
-  // Opt-in D$ address trace dump, for offline cache-geometry sweep tools
-  // (tools/cache_sweep/) -- see trace_dcache_access() in CPU_P64_6_Cycle.h.
-  // Purely additive: unset by default, never read back by the VP itself.
+  // Address traces for tools/cache_sweep/ (see trace_dcache_access()).
   if (const char *trace_path = std::getenv("VP_DCACHE_TRACE")) {
     dcache_trace_file = std::fopen(trace_path, "w");
     if (dcache_trace_file) {
@@ -143,7 +122,6 @@ CPURV64P6_Cycle::CPURV64P6_Cycle(sc_core::sc_module_name const &name,
     }
   }
 
-  // Same idea, I$ side -- see trace_icache_access() in CPU_P64_6_Cycle.h.
   if (const char *itrace_path = std::getenv("VP_ICACHE_TRACE")) {
     icache_trace_file = std::fopen(itrace_path, "w");
     if (icache_trace_file) {
@@ -153,7 +131,6 @@ CPURV64P6_Cycle::CPURV64P6_Cycle(sc_core::sc_module_name const &name,
     }
   }
 
-  // Start the main simulation thread
   SC_THREAD(cycle_thread);
 
   logger->info("Created CPURV64P6_Cycle (6-stage CVA6-aligned) CPU");
@@ -177,22 +154,12 @@ void CPURV64P6_Cycle::set_clock(sc_core::sc_clock *c) {
   if (clk)
     clock_period = clk->period();
 #ifdef ENABLE_AXI_CONTENTION
-  // Build the AXI contention subsystem now that the clock exists. Elaboration
-  // happens here (before sc_start), which is legal during module setup.
+  // The AXI model needs the clock, so it is built here rather than in the
+  // constructor (still before sc_start).
   if (clk && !axi_top) {
-    // Burst length is derived from EACH cache's own configured line width /
-    // the AXI data width the arbiter/slave were actually built at
-    // (riscv_axi::AxiCfg, see AxiConfigSelect.h): line bytes / (dataWidth/8)
-    // bytes-per-beat. Default 16B line, 64-bit build -> 2 beats (matches
-    // CVA6's real AXI width, verified against wt_axi_adapter.sv's own formula).
-    // I$ and D$ get independent beat counts (icache/dcache each have their
-    // own AxiRefillMaster instance, see AxiContentionTop.cpp) -- previously
-    // this used a single hardcoded-16B-line formula shared by both, which
-    // silently under-counted refill cost whenever either cache's line width
-    // was swept away from 16B (see docs/BUGS.md).
-    // TIMING_MODEL=CYCLE6_AXI128 build -> 1 beat at the 16B baseline
-    // (genuinely 128-bit wide, not an approximation). VP_AXI_BEATS still
-    // overrides BOTH caches' default for further side-by-side experiments.
+    // Beats per refill = line bytes / bus bytes, per cache: 16 B lines on the
+    // 64-bit bus give 2 beats, as in wt_axi_adapter.sv; the 128-bit build
+    // gives 1. VP_AXI_BEATS overrides both.
     int icache_burst_beats = static_cast<int>(decltype(icache)::LineBytes / (riscv_axi::AxiCfg::dataWidth / 8));
     int dcache_burst_beats = static_cast<int>(decltype(dcache)::LineBytes / (riscv_axi::AxiCfg::dataWidth / 8));
     if (icache_burst_beats < 1) icache_burst_beats = 1;
@@ -214,7 +181,6 @@ void CPURV64P6_Cycle::set_clock(sc_core::sc_clock *c) {
 // =============================================================================
 
 void CPURV64P6_Cycle::cycle_thread() {
-  // Initialize performance statistics
   stats.cycles = 0;
   stats.instructions = 0;
 
@@ -225,24 +191,20 @@ void CPURV64P6_Cycle::cycle_thread() {
 
   // --- Main Simulation Loop ---
   while (true) {
-    // WFI fast-forward: jump CLINT mtime to mtimecmp in one step,
-    // then wait a single clock edge for the signal to propagate.
+    // WFI: move mtime to one tick before mtimecmp, then sleep until an
+    // interrupt line changes instead of stepping every cycle (BUG-24).
     if (wfi_stall) {
       if (clint_ptr) {
         clint_ptr->fast_forward_to_deadline();
       }
-      // Per RISC-V spec WFI wakes when any interrupt is pending.
-      // Linux RISC-V idle pattern: WFI executes with SIE=0, then
-      // "csrsi sstatus,2" at WFI+4 re-enables SIE so STIP fires.
-      // So: if csr.mip & csr.mie != 0, wake immediately (wfi_stall=false)
-      // and let the pipeline resume at WFI+4 to enable SIE.
+      // WFI wakes on any pending enabled interrupt even with SIE clear.
+      // Linux idles with SIE=0 and sets it right after the wfi, so resume at
+      // wfi+4 and let that instruction enable the interrupt.
       bool csr_irq_pending = (csr.mip & csr.mie) != 0 || timer_irq_in.read() ||
                              msip_irq_in.read() || ext_irq_in.read();
       if (!csr_irq_pending) {
-        // Wait for any IRQ signal to change.
-        // Timeout matches CLINT_FF_GUARD ticks (100 ms) so after fast-forward
-        // we wait ~100 ms of simtime before the timer fires.  This gives the
-        // kernel and user processes ~10 M CPU cycles between interrupts.
+        // The timer fires one tick (1 us) after the fast-forward; the 100 ms
+        // timeout is only an upper bound.
         sc_core::wait(sc_core::sc_time(100000, sc_core::SC_US),
                       timer_irq_in.value_changed_event() |
                           msip_irq_in.value_changed_event() |
@@ -250,31 +212,27 @@ void CPURV64P6_Cycle::cycle_thread() {
       } else {
         wfi_stall = false;
       }
-      // Re-sync to the next clock edge
       if (clk)
         sc_core::wait(clk->posedge_event());
       else
         sc_core::wait(clock_period);
     } else {
-      // Synchronize with the SystemC simulation kernel
       if (clk) {
         sc_core::wait(clk->posedge_event());
       } else {
-        // Fallback if clock is not bound (should not happen in proper VP setup)
+        // no clock bound
         sc_core::wait(clock_period);
       }
     }
 
-    // Reset per-cycle commit capture
     commit_count_this_cycle = 0;
     committed_pc_this_cycle = 0;
     pending_csr_write.valid = false;
     global_cpu_cycle = stats.cycles;
 
-    // --- Pipeline Latch Transfer ---
-    // Move data from "Next" latches to "Current" latches to simulate clock edge
-    // updates. When stall_ex is set (partial store-buffer overlap), keep ALL
-    // latches unchanged so the load retries and upstream stages freeze.
+    // Clock edge: copy the *_next latches into the current ones. A stalled
+    // stage keeps its latch; stall_ex (partial store-buffer overlap) freezes
+    // everything so the load retries.
     if (prev_cycle_flush) {
       issue_ex_reg.valid = false;
       id_issue_reg.valid = false;
@@ -322,7 +280,7 @@ void CPURV64P6_Cycle::cycle_thread() {
           fetch_queue.erase(fetch_queue.begin());
         } else {
           fetch_id_reg.valid = false;
-          diag_if_empty_cycles++; // TEMP DIAGNOSTIC: true RTL if_empty equivalent
+          diag_if_empty_cycles++; // like the RTL's if_empty
         }
       }
     }
@@ -344,7 +302,6 @@ void CPURV64P6_Cycle::cycle_thread() {
     else
       csr.mip &= ~(1ULL << 9);
 
-    // Process any pending and enabled interrupts
     cpu_process_IRQ();
 
     // --- Execute Pipeline Stages (Reverse Order) ---
@@ -358,16 +315,10 @@ void CPURV64P6_Cycle::cycle_thread() {
     // 5. Execute: Perform ALU operations and memory address calculations.
     EX_stage();
 
-    // Capture flush flag here: EX_stage() sets it, PCGen_stage() will reset it.
-    // Must be captured before PCGen_stage() clears it so the trace records
-    // correctly.
+    // PCGen_stage() clears both flags, so keep copies for the trace and for
+    // the end-of-program check: the bubble cycle after a flush has an empty
+    // pipeline and must not be taken as the end.
     bool this_cycle_flush = flush_pipeline;
-    // Same idea for the redirect bubble (§B6 fix): PCGen_stage() consumes and
-    // clears taken_redirect_bubble this cycle, so capture it first. A flush
-    // drains the whole pipeline (fetch_queue, fetch/id/issue latches), so the
-    // bubble cycle that follows it looks pipeline-empty to the termination
-    // check below -- without this, that check fires a false "simulation
-    // done" the cycle after almost any flush.
     bool this_cycle_bubble = taken_redirect_bubble;
 
     // 4. Issue: Dispatch instructions to execution units and allocate ROB
@@ -381,13 +332,10 @@ void CPURV64P6_Cycle::cycle_thread() {
     Fetch_stage();
 
     // 1. PC Generation: Determine the next Program Counter.
-    // NOTE: PCGen_stage() resets flush_pipeline to false — use this_cycle_flush
-    // for trace.
     PCGen_stage();
 
-    // Update global cycle count and CSR hardware counters
     stats.cycles++;
-    if (commit_count_this_cycle == 0) { // TEMP DIAGNOSTIC
+    if (commit_count_this_cycle == 0) { // diagnostics only
       diag_zero_commit_cycles++;
       diag_stall_run_len++;
     } else if (diag_stall_run_len > 0) {
@@ -465,16 +413,13 @@ void CPURV64P6_Cycle::cycle_thread() {
       trace_idx = (trace_idx + 1) % trace_limit;
     }
 
-    // --- Termination Logic ---
-    // Stop simulation if the pipeline is completely empty and no new
-    // instructions are being fetched. We add a grace period (> 100 cycles) to
-    // allow the pipeline to fill up initially. During a pipeline flush/redirect
-    // or while in WFI stall waiting for interrupts, the pipeline may be
-    // temporarily empty but we must NOT terminate the simulation.
+    // End of program: everything is empty and nothing is being fetched.
+    // Not in the first 100 cycles, after a flush or bubble, or in WFI, where
+    // the pipeline is empty only for a moment.
     if (stats.cycles > 100 && !this_cycle_flush && !this_cycle_bubble && !wfi_stall &&
         !pcgen_fetch_reg.valid &&
         !pcgen_fetch_next
-             .valid && // Ensure no new instruction is being generated
+             .valid &&
         !fetch_id_reg.valid &&
         !id_issue_reg.valid && !issue_ex_reg.valid && scoreboard.is_empty()) {
 
@@ -505,17 +450,11 @@ void CPURV64P6_Cycle::PCGen_stage() {
     flush_pipeline = false;
     pc_redirect_valid = false;
     trap_pending = false; // Trap redirect consumed
-    // §B6 fix: a flush/misprediction redirect costs the same 1-cycle frontend
-    // steering bubble as a correctly-predicted taken branch (§B2's
-    // taken_redirect_bubble). Previously only charged on the predict-taken
-    // path, never here -- undercounted CVA6's real mispredict-recovery cost
-    // by exactly 1 cycle per mispredict (measured: 0.998 cyc/mispredict on
-    // robust_stress, see docs/BUGS.md §B6). Setting true (not false) both
-    // supersedes any stale pending bubble from before the flush AND charges
-    // the new one for this redirect.
-    // Only genuine branch/jump mispredicts pay the bubble; traps, interrupts
-    // and faults share flush_pipeline but were never validated against RTL.
-    { static const bool no_b6 = std::getenv("VP_NO_B6_BUBBLE") != nullptr;  // diagnostic A/B
+    // A mispredict redirect costs the same one-cycle bubble as a predicted
+    // taken branch (BUGS.md B6). Only branch/jump mispredicts pay it; traps and
+    // interrupts also come through here but were never checked against RTL.
+    // VP_NO_B6_BUBBLE turns it off for comparison.
+    { static const bool no_b6 = std::getenv("VP_NO_B6_BUBBLE") != nullptr;
       taken_redirect_bubble = flush_is_branch_mispredict && !no_b6; }
     flush_is_branch_mispredict = false;
     pcgen_fetch_next.valid = false;
@@ -545,9 +484,7 @@ void CPURV64P6_Cycle::PCGen_stage() {
   // If a structural hazard or backpressure exists (e.g., ROB full), do not
   // update the PC.
   if (stall_pcgen) {
-    // Keep current state (effectively repeating the same PC for next cycle if
-    // we were outputting it) or just doing nothing creates a bubble if not
-    // careful, but here 'next_pc' is persistent state.
+    // next_pc is kept, so the same PC goes out once the stall clears.
     return;
   }
 
@@ -566,8 +503,9 @@ void CPURV64P6_Cycle::PCGen_stage() {
   pcgen_fetch_next.pc = current_pc;
   pcgen_fetch_next.valid = true;
 
-  // --- Branch Prediction (CVA6-Aligned) ---
-  uint32_t btb_idx = (current_pc >> 2) % 32; // Word-aligned indexing
+  // Legacy predictor (VP_BP=legacy). With the default CVA6 rules prediction
+  // happens in Fetch instead, in cva6_predict().
+  uint32_t btb_idx = (current_pc >> 2) % 32;
   uint32_t bht_idx = (current_pc >> 2) % 128;
 
   bool predict_taken = false;
@@ -575,14 +513,12 @@ void CPURV64P6_Cycle::PCGen_stage() {
 
   if (!bp_cva6 && btb[btb_idx].valid && btb[btb_idx].tag == current_pc) {
     if (btb[btb_idx].is_return) {
-      // RAS Prediction
       if (!ras.empty()) {
         pt_target = ras.back();
         ras.pop_back(); // Speculatively pop
         predict_taken = true;
       }
     } else if (bht[bht_idx] >= 2) {
-      // Predict Taken
       pt_target = btb[btb_idx].target;
       predict_taken = true;
     }
@@ -608,8 +544,7 @@ void CPURV64P6_Cycle::Fetch_stage() {
   if (flush_pipeline) {
     icache_miss_remaining = 0;
 #ifdef ENABLE_AXI_CONTENTION
-    // Release any in-flight I$ refill so the master drains cleanly (its read
-    // completes and is discarded; ack drops req so it won't stall on us).
+    // Drop an in-flight I$ refill; its result is thrown away.
     if (icache_axi_pending) {
       axi_top->ack(riscv_axi::AxiContentionTop::ICACHE);
       icache_axi_pending = false;
@@ -666,8 +601,7 @@ void CPURV64P6_Cycle::Fetch_stage() {
   uint64_t current_pc = pcgen_fetch_reg.pc;
   uint32_t instr = 0;
 
-  // --- ITLB / MMU translation (Phase 8) ---
-  // When sv39 is active and not in M-mode, translate the instruction VA to PA.
+  // ITLB: translate the fetch address when sv39 is on and we are not in M-mode.
   uint64_t fetch_pa = current_pc;
   {
     auto tr = mmu->translate(current_pc, csr, MMU::FETCH);
@@ -683,7 +617,7 @@ void CPURV64P6_Cycle::Fetch_stage() {
         fetch_id_next.valid = false;
         return;
       }
-      // Instruction page fault — redirect to trap handler.
+      // Instruction page fault: redirect to trap handler.
       // tval = faulting virtual address (current_pc) per RISC-V spec.
       uint64_t tvec =
           csr.take_exception(tr.fault_cause, current_pc, current_pc);
@@ -755,8 +689,8 @@ void CPURV64P6_Cycle::Fetch_stage() {
 
   if (bp_cva6) {
     // CVA6 scans the instruction as it leaves the I$ and redirects PCGen.
-    // Stages run Fetch before PCGen, so the redirect lands this cycle; the
-    // taken-redirect bubble (§B2) keeps the same timing as the old path.
+    // Fetch runs before PCGen here, so the redirect takes effect this cycle,
+    // and a taken prediction still costs the one-cycle bubble (BUGS.md B2).
     uint64_t tgt = 0;
     bool taken = cva6_predict(current_pc, instr, is_c, tgt);
     fetch_id_next.predicted_taken = taken;
@@ -913,18 +847,15 @@ bool CPURV64P6_Cycle::fetch_instruction(uint64_t addr, uint32_t &data) {
 // =============================================================================
 
 void CPURV64P6_Cycle::ID_stage() {
-  // Check for Flush
   if (flush_pipeline) {
     id_issue_next.valid = false;
     return;
   }
 
-  // Check for Backpressure from Issue Stage
   if (stall_issue) {
     return; // Hold current state
   }
 
-  // Check Validity of Input
   if (!fetch_id_reg.valid) {
     id_issue_next.valid = false;
     return;
@@ -937,7 +868,6 @@ void CPURV64P6_Cycle::ID_stage() {
   id_issue_next.imm = 0;
   id_issue_next.is_illegal = false;
 
-  // Pass Branch Prediction Metadata
   id_issue_next.predicted_taken = fetch_id_reg.predicted_taken;
   id_issue_next.predicted_target = fetch_id_reg.predicted_target;
   id_issue_next.is_ras_call = false;
@@ -957,9 +887,9 @@ void CPURV64P6_Cycle::ID_stage() {
     op_C_Codes c_deco = c_inst->decode();
 
     switch (c_deco) {
-    // ── Quadrant 0 ────────────────────────────────────────────────────
+    // -- Quadrant 0 ----------------------------------------------------
     case OP_C_ADDI4SPN: {
-      // ADDI rd', x2, nzuimm — nzuimm=0 is illegal (spec §16.3)
+      // ADDI rd', x2, nzuimm: nzuimm=0 is illegal (spec 16.3)
       int64_t addi4spn_imm = static_cast<int64_t>(c_inst->get_imm_ADDI4SPN());
       if (addi4spn_imm == 0) {
         id_issue_next.is_illegal = true;
@@ -1029,9 +959,9 @@ void CPURV64P6_Cycle::ID_stage() {
       id_issue_next.imm = static_cast<int64_t>(c_inst->get_imm_CL());
       break;
 
-    // ── Quadrant 1 ────────────────────────────────────────────────────
+    // -- Quadrant 1 ----------------------------------------------------
     case OP_C_NOP:
-      // NOP → ADDI x0, x0, 0
+      // NOP -> ADDI x0, x0, 0
       id_issue_next.opcode = 0x13;
       id_issue_next.funct3 = 0;
       id_issue_next.rd = 0;
@@ -1049,7 +979,7 @@ void CPURV64P6_Cycle::ID_stage() {
       id_issue_next.imm = static_cast<int64_t>(c_inst->get_imm_ADDI());
       break;
     case OP_C_ADDIW:
-      // ADDIW rd, rd, imm  [RV64 — C.JAL maps here in RV64]
+      // ADDIW rd, rd, imm  [RV64: C.JAL maps here in RV64]
       id_issue_next.opcode = 0x1B;
       id_issue_next.funct3 = 0;
       id_issue_next.rd = c_inst->get_rs1();
@@ -1100,7 +1030,7 @@ void CPURV64P6_Cycle::ID_stage() {
       break;
     }
     case OP_C_SRAI: {
-      // SRAI rd', rd', shamt  — imm[10]=1 signals arithmetic shift in 64-bit
+      // SRAI rd', rd', shamt: imm[10]=1 signals arithmetic shift in 64-bit
       // SRLI/SRAI
       uint32_t shamt = (((ci >> 12) & 1) << 5) | ((ci >> 2) & 0x1F);
       id_issue_next.opcode = 0x13;
@@ -1175,7 +1105,7 @@ void CPURV64P6_Cycle::ID_stage() {
       id_issue_next.rs2 = c_inst->get_rs2p();
       break;
     case OP_C_J:
-      // JAL x0, offset  (C.J — no link, rd=0)
+      // JAL x0, offset  (C.J: no link, rd=0)
       id_issue_next.opcode = 0x6F;
       id_issue_next.rd = 0;
       id_issue_next.rs1 = 0;
@@ -1203,7 +1133,7 @@ void CPURV64P6_Cycle::ID_stage() {
           static_cast<int64_t>(static_cast<int32_t>(c_inst->get_imm_CB()));
       break;
 
-    // ── Quadrant 2 ────────────────────────────────────────────────────
+    // -- Quadrant 2 ----------------------------------------------------
     case OP_C_SLLI: {
       // SLLI rd, rd, shamt
       uint32_t shamt = (((ci >> 12) & 1) << 5) | ((ci >> 2) & 0x1F);
@@ -1261,7 +1191,7 @@ void CPURV64P6_Cycle::ID_stage() {
       id_issue_next.imm = 1;
       break;
     case OP_C_JALR:
-      // JALR x1, 0(rs1)  — stores pc+2 in ra (handled in EX via is_compressed)
+      // JALR x1, 0(rs1): stores pc+2 in ra (handled in EX via is_compressed)
       id_issue_next.opcode = 0x67;
       id_issue_next.funct3 = 0;
       id_issue_next.rd = 1; // ra
@@ -1462,24 +1392,21 @@ void CPURV64P6_Cycle::Issue_stage() {
     return;
   }
 
-  // Reset control signals initially
   stall_pcgen = false;
   stall_fetch = false;
   stall_issue = false;
 
-  // Check for Pipeline Flush
   if (flush_pipeline) {
     issue_ex_next.valid = false;
     return;
   }
 
-  // Check validity of input
   if (!id_issue_reg.valid) {
     issue_ex_next.valid = false;
     return;
   }
 
-  // --- Load->address dependency bubble (gather/pointer-chase, BUGS §B9) ---
+  // --- Load->address dependency bubble (gather/pointer-chase, BUGS.md B9) ---
   // Consume any pending extra cycles from a load result feeding a load/store
   // address before dispatching this instruction.
   if (load_addr_extra > 0) {
@@ -1547,8 +1474,8 @@ void CPURV64P6_Cycle::Issue_stage() {
   // --- Operand resolution with scoreboard forwarding (CVA6 rd_clobber path)
   // --- For each source register: if rd_clobber says it is busy, check whether
   // the producing scoreboard entry is already ready (EX ran before Issue this
-  // cycle). If ready  → forward the result directly; no stall needed. If not
-  // yet ready → stall until EX completes the producing instruction.
+  // cycle). If ready  -> forward the result directly; no stall needed. If not
+  // yet ready -> stall until EX completes the producing instruction.
   uint64_t rs1_val = 0, rs2_val = 0;
   bool need_stall = false;
 
@@ -1635,17 +1562,16 @@ void CPURV64P6_Cycle::Issue_stage() {
     }
   }
 
-  // 1-cycle pipeline bubble/stall for shift-to-adder/branch/store dependency
-  // If the producer instruction currently in EX is a shift instruction, and the
-  // consumer in Issue stage reads the register written by it, we force a 1-cycle stall
-  // UNLESS the consumer is a fast logical instruction (AND/OR/XOR) which can be bypassed.
-  // Superseded by the WAW rule below (tests/fpmb: a shift feeding a *different*
-  // rd is free in RTL; the old shift-only rule was a WAW artifact). Opt-in
-  // (VP_WAW_BUBBLE=1 EX-stage approx, =2 faithful rd_clobber rule) because
-  // it regresses long_test3 (+9%) and div_stress — see docs/BUGS.md §B12.
+  // VP_WAW_BUBBLE selects the same-register rule (BUGS.md B12):
+  //   0  old "shift bubble": stall a non-logical consumer of a shift in EX.
+  //      Wrong in general (a shift into a different register is free on the
+  //      RTL); kept only for comparison.
+  //   1  default: extra cycle for back-to-back ALU/multiply writes to one rd.
+  //   2  CVA6's general rule, wait while any uncommitted instruction writes
+  //      the same rd. Worse overall because the load case is not right yet.
   static const int waw_mode = [] { const char *e = std::getenv("VP_WAW_BUBBLE"); return e ? std::atoi(e) : 1; }();
-  const bool waw_bubble = (waw_mode == 1);      // EX-stage approximation
-  const bool waw_clobber = (waw_mode == 2);     // faithful: rd_clobber still busy
+  const bool waw_bubble = (waw_mode == 1);
+  const bool waw_clobber = (waw_mode == 2);
   if (waw_mode == 0 && issue_ex_reg.valid) {
     uint32_t ex_opcode = issue_ex_reg.instr & 0x7F;
     uint32_t ex_funct3 = (issue_ex_reg.instr >> 12) & 0x7;
@@ -1673,10 +1599,9 @@ void CPURV64P6_Cycle::Issue_stage() {
     }
   }
 
-  // Same-destination back-to-back integer ALU ops (WAW at distance 1) cost +1
-  // cycle in CVA6 whether or not the second reads the first's result
-  // (tests/fpmb: add a0,..; add a0,.. runs at 2 cyc/op). WAW at distance 2,
-  // WAR, and RAW into a *different* rd are free. Opt-in: VP_WAW_BUBBLE=1.
+  // Mode 1. Two back-to-back ALU ops writing the same rd cost one extra cycle
+  // on the RTL whether or not the second reads the first (add a0; add a0 runs
+  // at 2 cycles/op). Same rd two apart, WAR, and RAW into another rd are free.
   {
     auto is_int_alu = [](uint32_t op) { return op == 0x33 || op == 0x3B || op == 0x13 || op == 0x1B; };
     // mul (funct3<4) counts as a producer (mul->add same rd = 3 cyc/op in RTL);
@@ -1694,9 +1619,23 @@ void CPURV64P6_Cycle::Issue_stage() {
     }
   }
 
-  // CVA6 issue_read_operands.sv gen_check_waw_dependencies: stall while ANY
-  // in-flight (uncommitted) scoreboard entry writes the same rd; released when
-  // commit writes it (commit runs before issue here, so clobber is already clear).
+  // An instruction writing the same register (int or FP) as an FPU op still in
+  // flight waits until that op commits (gen_check_waw_dependencies). On the
+  // RTL a dependent same-register FP chain costs latency + 1. Not applied to
+  // load producers, which makes load-heavy code worse (BUGS.md B12).
+  // Known bug: rd != 0 also skips f0, which is a real FP register.
+  {
+    static const bool fpu_waw = [] { const char *e = std::getenv("VP_FPU_WAW"); return !(e && *e == '0'); }();
+    if (fpu_waw && id_issue_reg.rd != 0 && (writes_to_int_reg || writes_to_fp_reg)) {
+      const auto &clob = writes_to_fp_reg ? scoreboard.fp_clobber[id_issue_reg.rd]
+                                          : scoreboard.rd_clobber[id_issue_reg.rd];
+      if (clob.busy && clob.fu == FunctionalUnit::FPU) need_stall = true;
+    }
+  }
+
+  // Mode 2, CVA6's rule (gen_check_waw_dependencies): wait while any
+  // uncommitted instruction writes the same rd. Commit runs before Issue in a
+  // cycle, so an entry committing this cycle has already cleared it.
   if (waw_clobber && writes_to_int_reg && id_issue_reg.rd != 0 &&
       scoreboard.rd_clobber[id_issue_reg.rd].busy) {
     need_stall = true;
@@ -1727,12 +1666,9 @@ void CPURV64P6_Cycle::Issue_stage() {
     return;
   }
 
-  // --- Load->address dependency (gather/pointer-chase, BUGS §B9) ---
-  // A loaded value that flows (through address arithmetic) into a subsequent
-  // load/store ADDRESS costs CVA6 ~load_addr_penalty extra cycles vs the VP.
-  // Track a per-register "derives from a recent load" taint: loads taint their
-  // rd (at completion, in EX); address-arithmetic ALU ops (add/shift/etc.)
-  // propagate the taint; a memory op whose base (rs1) is tainted pays the bubble.
+  // Load result used as an address (pointer chase, gather; BUGS.md B9).
+  // Loads mark their rd when they complete, ALU ops pass the mark on, and a
+  // memory op whose base register is marked pays load_addr_penalty.
   {
     uint32_t op = id_issue_reg.opcode;
     uint8_t  rs1 = id_issue_reg.rs1, rd = id_issue_reg.rd;
@@ -1772,15 +1708,19 @@ void CPURV64P6_Cycle::Issue_stage() {
     }
   }
 
-  // --- Structural hazard: multi-cycle FU still occupied ---
-  // The scoreboard handles data hazards; this handles the case where two
-  // independent MUL/DIV/FPU instructions compete for the same physical unit.
-  // AMOs (0x2F) also use the dcache_miss_fu for D$ miss latency.
+  // Structural hazards: the unit this instruction needs is still busy.
+  // AMOs wait for a free miss slot like loads, although they never use one:
+  // they access memory directly and get no refill timing.
   if ((fu == FunctionalUnit::MUL && mul_fu.busy) ||
       (fu == FunctionalUnit::DIV && div_fu.busy) ||
-      (fu == FunctionalUnit::FPU && (fpu_pipe_full() || fpu_divsqrt_fu.busy)) || // pipelined addmul; div/sqrt blocks
+      // fpu_wrap.sv: FPnew accepts an op if its own op group is free, so add/mul
+      // proceed while div/sqrt runs; a div/sqrt behind a busy div/sqrt goes into
+      // the wrapper's hold register, and only later FPU ops stall (STALL state).
+      // VP_FPU_LEGACY_BLOCK=1: old model (any FPU op waits for div/sqrt).
+      (fu == FunctionalUnit::FPU && (fpu_pipe_full() || fpu_divsqrt_hold.busy ||
+                                     (fpu_legacy_block() && fpu_divsqrt_fu.busy))) ||
       // FP loads (0x07) are classified as FPU but share the single LSU/D$ path,
-      // so they must also wait for dcache_miss_fu — otherwise a second FP load
+      // so they must also wait for dcache_miss_fu: otherwise a second FP load
       // overwrites the in-flight miss and its scoreboard entry never completes.
       (id_issue_reg.opcode == 0x07 && dcache_miss_fu_full()) ||
       (fu == FunctionalUnit::LSU &&
@@ -1813,21 +1753,10 @@ void CPURV64P6_Cycle::Issue_stage() {
     return;
   }
 
-  // --- SYSTEM (0x73) serialization stall ---
-  // Root cause: when an ECALL/EBREAK fires a trap, EX calls scoreboard.flush()
-  // which discards ALL in-flight ROB entries.  If a multi-cycle instruction
-  // (D-cache miss load, MUL, DIV, FPU) is still executing, its result is lost
-  // and its destination register is left with stale data (the init crash bug).
-  //
-  // Correct fix: stall the SYSTEM instruction in Issue while ANY multi-cycle FU
-  // is busy.  Once all FUs are idle, every prior ROB entry is guaranteed to
-  // have ready=true.  When EX then fires the trap, the trap_pending drain loop:
-  //   while (head_ready() && head_index != ecall_rob_index) { commit; retire; }
-  // will write every prior result to the architectural register file before
-  // scoreboard.flush() runs — so no result is lost.
-  //
-  // This is simpler and deadlock-free: FU countdowns always terminate, there is
-  // no ROB-head PC comparison, and no duplicate-allocation edge case.
+  // SYSTEM instructions wait here until no multi-cycle unit is busy. A trap
+  // flushes the scoreboard, and a miss, mul, div or FP result still in flight
+  // would be lost (this crashed init). With all units idle, every older entry
+  // is ready and the trap path commits them before the flush.
   if (id_issue_reg.opcode == 0x73) {
     bool multi_cycle_in_flight =
         dcache_miss_fu_any_busy() || mul_fu.busy || div_fu.busy || fpu_any_busy() ||
@@ -1851,7 +1780,7 @@ void CPURV64P6_Cycle::Issue_stage() {
 
   // --- Populate scoreboard entry metadata ---
   scoreboard[rob_idx].pc = id_issue_reg.pc;
-  // AMOs (0x2F) write directly to mem_intf at EX time — they never use the
+  // AMOs (0x2F) write directly to mem_intf at EX time: they never use the
   // store buffer, so is_store must be false to prevent a spurious
   // commit_store() call.
   scoreboard[rob_idx].is_store =
@@ -1863,7 +1792,7 @@ void CPURV64P6_Cycle::Issue_stage() {
 
   // --- Illegal Instruction Check ---
   if (id_issue_reg.is_illegal) {
-    // Raise ILLEGAL_INSTR exception — trap handler will deal with it.
+    // Raise ILLEGAL_INSTR exception: trap handler will deal with it.
     // First, drain all older ready instructions so their register writes
     // are architecturally visible before the trap handler runs.
     while (scoreboard.head_ready()) {
@@ -1901,6 +1830,7 @@ void CPURV64P6_Cycle::Issue_stage() {
     for (auto &dt : dmiss_tail) dt.busy = false;
     for (int fs = 0; fs < FPU_SLOTS; fs++) fpu_pipe[fs].busy = false;
   fpu_divsqrt_fu.busy = false;
+  fpu_divsqrt_hold.busy = false;
     uint64_t tvec = csr.take_exception(CAUSE::ILLEGAL_INSTR, id_issue_reg.pc,
                                        id_issue_reg.instr);
     pc_redirect_target = tvec;
@@ -1945,7 +1875,7 @@ void CPURV64P6_Cycle::Issue_stage() {
 // =============================================================================
 
 void CPURV64P6_Cycle::EX_stage() {
-  // Clear stall_ex from previous cycle — will be re-set below if still needed.
+  // Clear stall_ex from previous cycle: will be re-set below if still needed.
   stall_ex = false;
 
   // --- Tick multi-cycle functional units (runs every cycle regardless of
@@ -1971,7 +1901,7 @@ void CPURV64P6_Cycle::EX_stage() {
     auto &dmf = dcache_miss_fu[dms];
     if (!dmf.busy) continue;
     stats.dcache_miss_cycles++;
-    // TEMP DIAGNOSTIC: does an I$ miss and D$ miss ever actually overlap?
+    // Diagnostic: count cycles where an I$ miss and a D$ miss overlap.
     if (dms == 0 && icache_miss_remaining > 0) diag_costall_cycles++;
 #ifdef ENABLE_AXI_CONTENTION
     if (dmf.trans_id == DMISS_HOLD) { // fill still occupying the miss path
@@ -1982,15 +1912,10 @@ void CPURV64P6_Cycle::EX_stage() {
     // (may be delayed behind an I$ miss holding the shared port = contention).
     if (axi_top->done(riscv_axi::AxiContentionTop::DCACHE)) {
       axi_top->ack(riscv_axi::AxiContentionTop::DCACHE);
-      // Use the value that actually came back through the AXI channel (real
-      // data, see AxiContentionTop::request()/set_pending_wdata()), not the
-      // pre-fetched dmf.result directly -- this is what makes the channel
-      // load-bearing rather than decorative. They must always be equal; the
-      // assert is the correctness proof that the data path is wired right.
+      // The load value is echoed through the AXI channel; check it matches
+      // what was read over TLM. Not an assert(), because Release builds
+      // define NDEBUG.
       uint64_t axi_result = axi_top->data(riscv_axi::AxiContentionTop::DCACHE);
-      // Deliberately NOT assert() -- this project builds Release (NDEBUG),
-      // which would silently strip the check. This is the correctness proof
-      // that the AXI channel's data path is wired right; it must always run.
       if (axi_result != dmf.result) {
         logger->error("AXI channel data mismatch: got {:#x}, expected {:#x} "
                       "(direct mem_intf/fpu fetch) -- data path bug",
@@ -2017,13 +1942,13 @@ void CPURV64P6_Cycle::EX_stage() {
         }
       }
       scoreboard.complete(dmf.trans_id, axi_result, dmf.rd);
-      if (dmf.rd != 0) reg_load_tainted |= (1u << dmf.rd); // §B9
+      if (dmf.rd != 0) reg_load_tainted |= (1u << dmf.rd); // BUGS.md B9
       dmf.busy = false;
     }
 #else
     if (--dmf.remaining == 0) {
       scoreboard.complete(dmf.trans_id, dmf.result, dmf.rd);
-      if (dmf.rd != 0) reg_load_tainted |= (1u << dmf.rd); // §B9
+      if (dmf.rd != 0) reg_load_tainted |= (1u << dmf.rd); // BUGS.md B9
       dmf.busy = false;
     }
 #endif
@@ -2032,7 +1957,7 @@ void CPURV64P6_Cycle::EX_stage() {
     if (!dt.busy) continue;
     if (--dt.remaining == 0) {
       scoreboard.complete(dt.trans_id, dt.result, dt.rd);
-      if (dt.rd != 0) reg_load_tainted |= (1u << dt.rd); // §B9
+      if (dt.rd != 0) reg_load_tainted |= (1u << dt.rd); // BUGS.md B9
       dt.busy = false;
     }
   }
@@ -2041,7 +1966,7 @@ void CPURV64P6_Cycle::EX_stage() {
     if (!lh.busy) continue;
     if (--lh.remaining == 0) {
       scoreboard.complete(lh.trans_id, lh.result, lh.rd);
-      if (lh.rd != 0) reg_load_tainted |= (1u << lh.rd); // §B9
+      if (lh.rd != 0) reg_load_tainted |= (1u << lh.rd); // BUGS.md B9
       lh.busy = false;
     }
   }
@@ -2059,21 +1984,23 @@ void CPURV64P6_Cycle::EX_stage() {
     if (--fpu_divsqrt_fu.remaining == 0) {
       scoreboard.complete(fpu_divsqrt_fu.trans_id, fpu_divsqrt_fu.result, fpu_divsqrt_fu.rd);
       fpu_divsqrt_fu.busy = false;
+      if (fpu_divsqrt_hold.busy) {
+        // The held div/sqrt was accepted one cycle before this result left the
+        // unit (RTL: back-to-back div/sqrt 22 cycles each vs 23 latency).
+        fpu_divsqrt_fu = fpu_divsqrt_hold;
+        fpu_divsqrt_hold.busy = false;
+        if (fpu_divsqrt_fu.remaining > 1) fpu_divsqrt_fu.remaining--;
+      }
     }
   }
 
   if (!issue_ex_reg.valid)
     return;
 
-  // Guard: if cpu_process_IRQ already took control this cycle
-  // (flush_pipeline=true), the ROB is flushed and sepc/irq_epc are set to the
-  // correct resume address. Executing issue_ex_reg now would:
-  //   (a) corrupt flushed ROB entries via scoreboard.complete()
-  //   (b) call take_exception() if the instruction faults, overwriting the
-  //   correct sepc
-  // This is the root cause of the init SIGBUS: IRQ sepc=0x1014a (AUIPC) was
-  // being overwritten by a load-page-fault sepc=0x1014e before the kernel ever
-  // saw 0x1014a.
+  // An interrupt was taken this cycle: the scoreboard is already flushed and
+  // sepc points at the resume address. Executing now would complete flushed
+  // entries, and a faulting instruction would overwrite sepc (this caused a
+  // SIGBUS in init).
   if (flush_pipeline) {
     return;
   }
@@ -2122,7 +2049,7 @@ void CPURV64P6_Cycle::EX_stage() {
         mul_result = static_cast<uint64_t>(
             (static_cast<unsigned __int128>(u1) * u2) >> 64);
         break;
-      case 0x4: // DIV (signed) — division by zero and overflow per spec
+      case 0x4: // DIV (signed): division by zero and overflow per spec
         mul_result = (s2 == 0) ? static_cast<uint64_t>(-1LL)
                      : (s1 == INT64_MIN && s2 == -1LL)
                          ? static_cast<uint64_t>(s1)
@@ -2291,7 +2218,7 @@ void CPURV64P6_Cycle::EX_stage() {
       case 0x0: // MULW
         w_result = static_cast<int64_t>(static_cast<int32_t>(ws1 * ws2));
         break;
-      case 0x4: // DIVW — div-by-zero and INT32_MIN/-1 overflow per spec
+      case 0x4: // DIVW: div-by-zero and INT32_MIN/-1 overflow per spec
         w_result = (ws2 == 0) ? static_cast<int64_t>(-1)
                    : (ws1 == INT32_MIN && ws2 == -1)
                        ? static_cast<int64_t>(ws1)
@@ -2438,7 +2365,6 @@ void CPURV64P6_Cycle::EX_stage() {
         vaddr; // declared before goto to avoid crossing initialization
     int cur_dcache_slot = -1; // slot allocated for THIS load's miss (if any)
 
-    // Alignment check
     bool misaligned = false;
     switch (issue_ex_reg.funct3) {
     case 0x1:
@@ -2510,7 +2436,7 @@ void CPURV64P6_Cycle::EX_stage() {
       goto ex_done;
     }
 
-    // DTLB translation (Phase 8)
+    // DTLB
     {
       auto tr = mmu->translate(vaddr, csr, MMU::LOAD);
       if (tr.fault) {
@@ -2603,8 +2529,8 @@ void CPURV64P6_Cycle::EX_stage() {
       goto ex_done;
     }
     if (fwd_result == StoreBuffer<4, 4>::FwdResult::HIT) {
-      // Load-to-store forwarding: data comes from the store buffer
-      // (CVA6 12-bit page-offset alias check confirmed a safe match).
+      // Forward from the store buffer. CVA6 doesn't do this: on a page-offset
+      // match its load waits for the store buffer to drain (load_unit.sv).
       uint64_t fwd_result_val = 0;
       switch (issue_ex_reg.funct3) {
       case 0x0:
@@ -2633,7 +2559,7 @@ void CPURV64P6_Cycle::EX_stage() {
         break;
       }
       stats.load_store_forwards++;
-      // load-use stall: configured by load_hit_penalty to represent AXI bus latency on hits.
+      // Same latency as a D$ hit.
       if (int ls = load_hit_free_slot(); ls >= 0) {
         auto &lf = load_hit_pipe[ls];
         lf.busy = true;
@@ -2644,7 +2570,7 @@ void CPURV64P6_Cycle::EX_stage() {
       }
       multi_cycle_dispatched = true;
     } else {
-      // FwdResult::MISS — no overlapping stores in the buffer; safe to read
+      // FwdResult::MISS, no overlapping stores in the buffer; safe to read
       // memory.
       uint64_t mem_result = 0;
       switch (issue_ex_reg.funct3) {
@@ -2685,7 +2611,7 @@ void CPURV64P6_Cycle::EX_stage() {
         axi_top->set_pending_wdata(riscv_axi::AxiContentionTop::DCACHE, mem_result);
 #endif
       } else {
-        // D$ timing check: hit → result available this cycle; miss → defer via
+        // D$ timing check: hit -> result available this cycle; miss -> defer via
         // FU.
         trace_dcache_access(addr);
         if (!dcache.access(addr)) {
@@ -2706,7 +2632,7 @@ void CPURV64P6_Cycle::EX_stage() {
           dmf.rd = issue_ex_reg.rd;
           multi_cycle_dispatched = true;
         } else {
-          // D$ hit: result available next cycle — load-use stall configured by load_hit_penalty.
+          // D$ hit: result ready load_hit_penalty cycles later (3-cycle RTL hit).
           if (int ls = load_hit_free_slot(); ls >= 0) {
             auto &lf = load_hit_pipe[ls];
             lf.busy = true;
@@ -2720,12 +2646,11 @@ void CPURV64P6_Cycle::EX_stage() {
       }
     }
   } else if (issue_ex_reg.opcode ==
-             0x23) { // Store → translate VA then add to speculative queue
+             0x23) { // Store -> translate VA then add to speculative queue
     uint64_t vaddr_s = issue_ex_reg.rs1_val + issue_ex_reg.imm;
     uint64_t store_pa =
         vaddr_s; // declared before goto to avoid crossing initialization
 
-    // Alignment check
     bool misaligned = false;
     switch (issue_ex_reg.funct3) {
     case 0x1: // halfword
@@ -2742,7 +2667,7 @@ void CPURV64P6_Cycle::EX_stage() {
       break;
     }
     if (misaligned) {
-      // Handle natively — byte-level write after VA→PA translation.
+      // Handle natively: byte-level write after VA->PA translation.
       auto tr_us = mmu->translate(vaddr_s, csr, MMU::STORE);
       if (tr_us.fault) {
         if (has_unready_older()) {
@@ -2768,7 +2693,7 @@ void CPURV64P6_Cycle::EX_stage() {
       for (int i = 0; i < us_bytes; i++)
         mem_intf->writeDataMem(
             pa_us + i, static_cast<uint32_t>((sval >> (8 * i)) & 0xFF), 1);
-      // Misaligned store bypassed store buffer — clear is_store so
+      // Misaligned store bypassed store buffer: clear is_store so
       // Commit_stage does not call commit_store() (which would pop the
       // wrong spec entry and desynchronise the FIFO).
       scoreboard[issue_ex_reg.rob_index].is_store = false;
@@ -2836,14 +2761,14 @@ void CPURV64P6_Cycle::EX_stage() {
       load_reservation_valid = false;
     }
   } else if (issue_ex_reg.opcode ==
-             0x2F) { // AMO — Atomic Memory Operations (A extension)
+             0x2F) { // AMO: Atomic Memory Operations (A extension)
     uint64_t vaddr_a = issue_ex_reg.rs1_val;
     uint64_t pa_a = vaddr_a;
     bool is_dword = (issue_ex_reg.funct3 == 0x3);
     uint32_t funct5 = issue_ex_reg.funct7 >> 2; // bits[31:27]
 
     // VA -> PA translation.
-    // LR is a load — use LOAD permission. SC and AMO RMW require STORE
+    // LR is a load: use LOAD permission. SC and AMO RMW require STORE
     // permission.
     {
       MMU::access_t amo_atype = (funct5 == 0x2) ? MMU::LOAD : MMU::STORE;
@@ -2868,10 +2793,10 @@ void CPURV64P6_Cycle::EX_stage() {
     }
 
     if (funct5 == 0x2) { // LR.W / LR.D
-      // Check store buffer first — committed-but-not-yet-drained stores must be
+      // Check store buffer first: committed-but-not-yet-drained stores must be
       // visible to LR (same ordering guarantee as regular loads).
-      // Note: Issue stage stalls AMOs on non-empty store buffer, so this
-      // should normally be MISS. Handling HIT/PARTIAL for robustness.
+      // Issue holds AMOs until the store buffer is empty, so this should
+      // always be a miss; the other cases are handled anyway.
       int lr_size = is_dword ? 8 : 4;
       uint64_t fwd_lr = 0;
       auto lr_fwd = store_buffer.forward_load(pa_a, lr_size, fwd_lr);
@@ -3016,7 +2941,6 @@ void CPURV64P6_Cycle::EX_stage() {
        issue_ex_reg.opcode == 0x67);
 
   if (is_branch_instruction) {
-    // Alignment check
     if (branch_taken && (branch_target & 1)) {
       if (has_unready_older()) {
         stall_ex = true;
@@ -3034,7 +2958,6 @@ void CPURV64P6_Cycle::EX_stage() {
       goto ex_done;
     }
 
-    // Verify Prediction
     bool mispredict =
         (branch_taken != issue_ex_reg.predicted_taken) ||
         (branch_taken && (branch_target != issue_ex_reg.predicted_target));
@@ -3054,11 +2977,11 @@ void CPURV64P6_Cycle::EX_stage() {
         c6_btb[(issue_ex_reg.pc >> 1) % 32] = {true, branch_target};
       }
     } else {
-      // Train Predictor
+      // Legacy predictor training (VP_BP=legacy).
       uint32_t btb_idx = (issue_ex_reg.pc >> 2) % 32;
       uint32_t bht_idx = (issue_ex_reg.pc >> 2) % 128;
 
-      if (issue_ex_reg.opcode == 0x63) { // Conditional Branch
+      if (issue_ex_reg.opcode == 0x63) {
         uint8_t current_bht = bht[bht_idx];
         if (branch_taken) {
           if (current_bht < 3)
@@ -3067,17 +2990,16 @@ void CPURV64P6_Cycle::EX_stage() {
           if (current_bht > 0)
             bht[bht_idx]--;
         }
-        btb[btb_idx].tag = issue_ex_reg.pc; // Tag to prevent aliasing
+        btb[btb_idx].tag = issue_ex_reg.pc;
         btb[btb_idx].target = branch_target;
         btb[btb_idx].valid = true;
         btb[btb_idx].is_return = false;
-      } else {                              // Unconditional Jump (JAL/JALR)
-        btb[btb_idx].tag = issue_ex_reg.pc; // Tag to prevent aliasing
+      } else {                              // jal / jalr
+        btb[btb_idx].tag = issue_ex_reg.pc;
         btb[btb_idx].target = branch_target;
         btb[btb_idx].valid = true;
-        bht[bht_idx] = 3; // Force Strongly Taken
+        bht[bht_idx] = 3; // jumps are always taken
 
-        // RAS Maintenance
         if (issue_ex_reg.is_ras_call) {
           ras.push_back(issue_ex_reg.pc + (issue_ex_reg.is_compressed ? 2 : 4));
           if (ras.size() > 2)
@@ -3089,7 +3011,6 @@ void CPURV64P6_Cycle::EX_stage() {
       }
     }
 
-    // Redirect on Mispredict
     if (mispredict) {
       pc_redirect_target =
           branch_taken
@@ -3122,6 +3043,8 @@ void CPURV64P6_Cycle::EX_stage() {
       cancel_if_flushed(div_fu);
       for (int fs = 0; fs < FPU_SLOTS; fs++) cancel_if_flushed(fpu_pipe[fs]);
       cancel_if_flushed(fpu_divsqrt_fu);
+      cancel_if_flushed(fpu_divsqrt_hold);
+      if (!fpu_divsqrt_fu.busy && fpu_divsqrt_hold.busy) { fpu_divsqrt_fu = fpu_divsqrt_hold; fpu_divsqrt_hold.busy = false; }
       for (int i = 0; i < dcache_miss_slots_active; i++) {
 #ifdef ENABLE_AXI_CONTENTION
         // Selective flush: release the D$ AXI refill only if this branch
@@ -3146,9 +3069,9 @@ void CPURV64P6_Cycle::EX_stage() {
     const uint16_t csr_addr = static_cast<uint16_t>(issue_ex_reg.imm & 0xFFF);
 
     if (f3 == 0) {
-      // ECALL / EBREAK / MRET / SRET — distinguished by imm
+      // ECALL / EBREAK / MRET / SRET: distinguished by imm
       if (csr_addr == 0x000) {
-        // ECALL — raise exception
+        // ECALL: raise exception
         uint64_t cause;
         switch (csr.priv) {
         case PrivMode::U:
@@ -3194,7 +3117,7 @@ void CPURV64P6_Cycle::EX_stage() {
             break;
           }
         } else {
-          // S/U mode ECALL — trap to handler
+          // S/U mode ECALL: trap to handler
           if (has_unready_older()) {
             stall_ex = true;
             multi_cycle_dispatched = true;
@@ -3207,10 +3130,8 @@ void CPURV64P6_Cycle::EX_stage() {
           pc_redirect_valid = true;
         }
       } else if (csr_addr == 0x001) {
-        // EBREAK — raise Breakpoint exception (cause=3).
-        // OpenSBI uses EBREAK to probe for debugger presence; it must
-        // trap to the M-mode handler (mtvec), NOT halt the simulation.
-        // Per RISC-V spec: mtval=0 for breakpoints (not the faulting PC).
+        // EBREAK traps (cause 3, mtval 0) instead of stopping the
+        // simulation: OpenSBI uses it to probe for a debugger.
 
         if (has_unready_older()) {
           stall_ex = true;
@@ -3224,7 +3145,7 @@ void CPURV64P6_Cycle::EX_stage() {
         flush_pipeline = true;
         trap_pending = true;
       } else if (csr_addr == 0x302) {
-        // MRET — privilege check: must be in M-mode
+        // MRET, M-mode only
         if (csr.priv != PrivMode::M) {
           uint64_t tvec = csr.take_exception(
               CAUSE::ILLEGAL_INSTR, issue_ex_reg.pc, issue_ex_reg.instr);
@@ -3242,7 +3163,7 @@ void CPURV64P6_Cycle::EX_stage() {
           pending_priv_switch_epc = ret_pc;
         }
       } else if (csr_addr == 0x102) {
-        // SRET — privilege check: must be in S or M mode; TW trap check
+        // SRET: illegal in U-mode, and in S-mode when mstatus.TSR is set
         if (csr.priv == PrivMode::U ||
             (csr.priv == PrivMode::S && (csr.mstatus & MSTATUS::TSR))) {
           uint64_t tvec = csr.take_exception(
@@ -3260,7 +3181,7 @@ void CPURV64P6_Cycle::EX_stage() {
           pending_priv_switch_epc = ret_pc;
         }
       } else if (csr_addr == 0x105) {
-        // WFI — wait for interrupt.
+        // WFI: wait for interrupt.
         // TW: trap on WFI in S/U mode if mstatus.TW=1
         if (csr.priv != PrivMode::M && (csr.mstatus & MSTATUS::TW)) {
           uint64_t tvec = csr.take_exception(
@@ -3295,7 +3216,7 @@ void CPURV64P6_Cycle::EX_stage() {
           pc_redirect_target = issue_ex_reg.pc + 4;
           pc_redirect_valid = true;
         }
-        // Other unknown funct12 — treat as NOP (future: illegal instruction
+        // Other unknown funct12: treat as NOP (future: illegal instruction
         // trap)
       }
     } else {
@@ -3307,7 +3228,7 @@ void CPURV64P6_Cycle::EX_stage() {
       bool ok = false;
       uint64_t old_val = csr.read(csr_addr, ok);
       if (!ok) {
-        // Illegal CSR access — trap
+        // Illegal CSR access: trap
         if (has_unready_older()) {
           stall_ex = true;
           multi_cycle_dispatched = true;
@@ -3337,14 +3258,10 @@ void CPURV64P6_Cycle::EX_stage() {
           pending_csr_write = {true, csr_addr};
         }
         result = old_val; // CSR rd gets previous value
-        // Changing satp (address space switch) invalidates all TLBs and must
-        // serialise the pipeline.  Real CVA6 hardware flushes the pipeline on
-        // satp writes so that the Fetch stage never re-translates an already
-        // in-flight PC through the newly-active page tables.  Without this flush
-        // Fetch (which runs in the same sim-cycle as EX) would immediately try
-        // to translate a stale physical PC like 0x80201048 through the new sv39
-        // page tables, find no identity mapping, take an instruction page-fault,
-        // and redirect to stvec — hanging the simulator at early boot.
+        // A satp write flushes both TLBs and the pipeline, as CVA6 does
+        // (csr_regfile.sv). Otherwise Fetch, which runs in the same cycle,
+        // translates an old PC with the new page table and faults (early-boot
+        // hang).
         if (csr_addr == CSR::SATP) {
           mmu->flush_all();
           // Redirect to PC+4 through the new translation mode.
@@ -3380,7 +3297,6 @@ void CPURV64P6_Cycle::EX_stage() {
     uint64_t fp_load_pa = 0; // carries FP-load paddr to the miss-handling site (AXI)
     if (issue_ex_reg.opcode == 0x07) { // Load-FP
       uint64_t vaddr = issue_ex_reg.rs1_val + issue_ex_reg.imm;
-      // Alignment check
       bool misaligned = false;
       if (issue_ex_reg.funct3 == 2) {
         if (vaddr & 3)
@@ -3448,7 +3364,6 @@ void CPURV64P6_Cycle::EX_stage() {
       }
     } else if (issue_ex_reg.opcode == 0x27) { // Store-FP
       uint64_t vaddr = issue_ex_reg.rs1_val + issue_ex_reg.imm;
-      // Alignment check
       bool misaligned = false;
       if (issue_ex_reg.funct3 == 2) {
         if (vaddr & 3)
@@ -3578,17 +3493,14 @@ void CPURV64P6_Cycle::EX_stage() {
     }
 
     if (fp_load_dcache_miss) {
-      // FP load that missed in the D$: defer completion by the miss penalty,
-      // exactly as the integer load path does. The FP register file was already
-      // written by execute(); only the timing is modelled here.
+      // FP load miss: same refill timing as an integer load miss. The FP
+      // register is already written by execute(); this only delays completion.
       int fp_slot = dcache_miss_free_slot();
       if (fp_slot < 0) fp_slot = 0; // defensive fallback
       auto &dmf = dcache_miss_fu[fp_slot];
       dmf.busy = true;
 #ifdef ENABLE_AXI_CONTENTION
-      // fpu_result is already known here (FP regfile was written by
-      // execute()) -- pass it through so axi_top->data() returns the real
-      // value instead of a placeholder.
+      // Pass the loaded value so it is echoed back through the AXI channel.
       axi_top->request(riscv_axi::AxiContentionTop::DCACHE, fp_load_pa, false, fpu_result);
 #else
       dmf.remaining = dcache_miss_penalty - 1;
@@ -3600,12 +3512,14 @@ void CPURV64P6_Cycle::EX_stage() {
       // Single-cycle FPU ops (FMV, FCLASS, etc.): complete immediately.
       scoreboard.complete(issue_ex_reg.rob_index, fpu_result, issue_ex_reg.rd);
     } else if (latency > 5) {
-      // FP divide/sqrt: iterative, non-pipelined — blocking unit (stalls issue).
-      fpu_divsqrt_fu.busy = true;
-      fpu_divsqrt_fu.remaining = latency - 1;
-      fpu_divsqrt_fu.result = fpu_result;
-      fpu_divsqrt_fu.trans_id = issue_ex_reg.rob_index;
-      fpu_divsqrt_fu.rd = issue_ex_reg.rd;
+      // FP divide/sqrt: iterative, non-pipelined. If it is busy, the op waits
+      // in the wrapper's hold register and starts when the unit frees.
+      auto &dst = fpu_divsqrt_fu.busy ? fpu_divsqrt_hold : fpu_divsqrt_fu;
+      dst.busy = true;
+      dst.remaining = latency - 1;
+      dst.result = fpu_result;
+      dst.trans_id = issue_ex_reg.rob_index;
+      dst.rd = issue_ex_reg.rd;
     } else {
       // Pipelined addmul/convert: place in a free slot (Issue stalls if all busy).
       int slot = -1;
@@ -3620,7 +3534,7 @@ void CPURV64P6_Cycle::EX_stage() {
     multi_cycle_dispatched = true;
   }
 
-// 5. Complete instruction in scoreboard — result stored here until commit.
+// 5. Complete instruction in scoreboard: result stored here until commit.
 //    Multi-cycle FUs (MUL/DIV/D$-miss) call complete() themselves when they
 //    finish.
 ex_done:
@@ -3629,12 +3543,8 @@ ex_done:
   }
 
   if (trap_pending) {
-    // Synchronous traps (ECALL, page fault, illegal instr, etc.):
-    // All instructions older than the trapping instruction are architecturally
-    // committed — their register writes must be visible before we enter the
-    // trap handler.  Drain ready ROB entries from head up to (but not
-    // including) the trapping instruction's rob_index.
-    //
+    // Synchronous trap: commit everything older than the trapping
+    // instruction first, so the handler sees their results.
 
     while (scoreboard.head_ready() &&
            scoreboard.get_head_index() != issue_ex_reg.rob_index) {
@@ -3675,6 +3585,7 @@ ex_done:
     for (auto &dt : dmiss_tail) dt.busy = false;
     for (int fs = 0; fs < FPU_SLOTS; fs++) fpu_pipe[fs].busy = false;
   fpu_divsqrt_fu.busy = false;
+  fpu_divsqrt_hold.busy = false;
     multi_cycle_dispatched = true;
     load_reservation_valid = false;
   }
@@ -3689,9 +3600,8 @@ void CPURV64P6_Cycle::Commit_stage() {
     store_drain_remaining--;
   }
 
-  // Always try to drain one committed store to memory each cycle,
-  // independent of whether a new instruction is committing.
-  // Restricted by write-through DRAM latency stalls.
+  // Drain one committed store per cycle, whether or not anything commits.
+  // store_write_penalty is 0, so the drain never waits.
   if (store_drain_remaining == 0) {
     uint64_t addr, data;
     int size;
@@ -3757,12 +3667,11 @@ void CPURV64P6_Cycle::Commit_stage() {
     if (perf)
       perf->instructionsInc();
     pending_priv_switch =
-        false; // instruction committed → priv switch is architecturally visible
+        false; // instruction committed -> priv switch is architecturally visible
     commit_count_this_cycle++;
     committed_pc_this_cycle = entry.pc;
     pc_current = entry.pc;
 
-    // Per-privilege instruction counter
     if (csr.priv == PrivMode::M)
       stats.m_instrs++;
     else if (csr.priv == PrivMode::S) {
@@ -3771,7 +3680,7 @@ void CPURV64P6_Cycle::Commit_stage() {
       stats.u_instrs++;
     }
 
-    // 4. Retire — advance scoreboard head pointer.
+    // 4. Retire: advance scoreboard head pointer.
     scoreboard.retire();
   }
 
@@ -3788,12 +3697,9 @@ bool CPURV64P6_Cycle::cpu_process_IRQ() {
   if (cause < 0)
     return false;
 
-  // Determine EPC BEFORE flushing the scoreboard.
-  // After scoreboard.flush() the ROB is empty; computing EPC post-flush falls
-  // through to id_issue_reg and picks the wrong (younger) instruction.
-  // The oldest in-flight instruction is the scoreboard head; if the ROB is
-  // already empty but issue_ex_reg or later latches still carry instructions
-  // those are the oldest un-committed work and must be re-executed.
+  // The EPC has to be found before the flush: it is the oldest uncommitted
+  // instruction, i.e. the scoreboard head, or the oldest latch if the
+  // scoreboard is empty.
   uint64_t irq_epc;
   if (pending_priv_switch) {
     irq_epc = pending_priv_switch_epc;
@@ -3814,7 +3720,6 @@ bool CPURV64P6_Cycle::cpu_process_IRQ() {
     }
   }
 
-  // Flush pipeline and redirect to interrupt handler
 
   scoreboard.flush();
   store_buffer.flush_speculative();
@@ -3829,9 +3734,10 @@ bool CPURV64P6_Cycle::cpu_process_IRQ() {
   for (auto &dt : dmiss_tail) dt.busy = false;
   for (int fs = 0; fs < FPU_SLOTS; fs++) fpu_pipe[fs].busy = false;
   fpu_divsqrt_fu.busy = false;
+  fpu_divsqrt_hold.busy = false;
   stall_ex = false; // Cancel any pending EX replay
 
-  // Invalidate any outstanding LR reservation — per RISC-V spec, interrupts
+  // Invalidate any outstanding LR reservation: per RISC-V spec, interrupts
   // must break LR/SC sequences to prevent livelock across interrupt handlers.
   load_reservation_valid = false;
 
@@ -3956,12 +3862,10 @@ void CPURV64P6_Cycle::dumpPipelineTrace(const std::string &filename) const {
     return;
   }
 
-  // CSV Header
   ofs << "cycle,pc_pcgen,pc_fetch,pc_id,pc_issue,pc_ex,pc_commit,"
       << "pcgen_valid,fetch_valid,id_valid,issue_valid,ex_valid,commit_valid,"
       << "stall_pcgen,stall_fetch,stall_issue,flush\n";
 
-  // CSV Rows
   size_t size = pipeline_trace.size();
   size_t start = (size < trace_limit) ? 0 : trace_idx;
   for (size_t i = 0; i < size; ++i) {

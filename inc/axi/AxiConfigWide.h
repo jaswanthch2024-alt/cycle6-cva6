@@ -1,22 +1,9 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-// AxiConfigWide -- wider-than-64-bit AXI data-width configs (128/256/512/1024),
-// for side-by-side "what if AxiDataWidth were wider" experiments ONLY. CVA6
-// RTL always uses 64-bit AXI (CVA6ConfigAxiDataWidth=64, verified in every
-// shipped cva6_config_pkg.sv); no CVA6 target has ever validated any of these
-// widths. Do not use results built against these configs as an RTL-accuracy
-// claim -- see TIMING_MODEL=CYCLE6_AXI128/256/512/1024 in CMakeLists.txt and
-// inc/axi/AxiConfigSelect.h for how one is selected per build.
-//
-// Field-for-field identical to matchlib's axi::cfg::standard (see
-// third_party/matchlib_kit/matchlib-main/cmod/include/axi/axi4_configs.h)
-// except dataWidth. Defined here, not by editing the vendored kit, per the
-// project's public-source-only vendoring policy.
-//
-// Beats-per-16B-line at each width (see CPU_P64_6_Cycle.cpp's
-// `16 / (AxiCfg::dataWidth/8)` derivation, floored at 1): 128-bit -> 1 beat
-// (exact); 256/512/1024-bit -> also 1 beat (a single beat is already wider
-// than the whole cache line at these widths -- the floor-at-1 clamp in that
-// formula is what makes this correct instead of computing 0).
+// AXI configs wider than 64 bits, for experiments. Every CVA6 config uses a
+// 64-bit AXI bus, so results with these are not checked against RTL.
+// Same fields as matchlib's axi::cfg::standard except dataWidth; kept here so
+// the vendored kit stays unmodified. A 16 B line is one beat at 128 bits and
+// above (the beat count is clamped to at least 1).
 #pragma once
 #ifndef AXI_CONFIG_WIDE_H
 #define AXI_CONFIG_WIDE_H

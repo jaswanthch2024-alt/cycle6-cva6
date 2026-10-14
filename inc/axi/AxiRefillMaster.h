@@ -1,26 +1,15 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-// AxiRefillMaster — a matchlib AXI4 read/write manager driven by a race-free
-// sc_signal handshake from the Cycle6 pipeline. One instance per contending
-// source (I$, D$, later store-drain). Used ONLY by the CYCLE6_AXI build.
+// One AXI master per requester (I$, D$, store drain), CYCLE6_AXI build only.
+// The pipeline talks to it through sc_signals:
+//   req_valid, req_addr, req_wdata  in
+//   resp_valid, resp_data           out; resp_valid stays up until req_valid drops
+// resp_data returns req_wdata, also for reads, so the value the CPU read over
+// TLM travels through the channel; the slave's own data is thrown away.
 //
-// Handshake (all sc_signal, so ordering within a delta is irrelevant):
-//   pipeline -> master : req_valid (pulse/hold), req_addr, req_wdata (real data)
-//   master -> pipeline : resp_valid (held until pipeline drops req_valid), resp_data
-// resp_data carries the CPU's real value (echoed from req_wdata on reads too,
-// not just writes) -- the burst itself still runs for real timing/arbitration,
-// but its own synthetic payload is discarded. See AxiContentionTop.h.
-//
-// Reads issue a real AXI INCR burst, not a single beat: CVA6's own AXI adapter
-// (wt_axi_adapter.sv) computes AxiRdBlenIcache/Dcache = LINE_WIDTH/AxiDataWidth-1
-// = 128/64-1 = 1, i.e. a 2-beat burst per 16 B line at the real 64-bit AXI
-// width -- verified directly from the RTL formula. BURST_BEATS below mirrors
-// that. The slave (MinimalAxiMemSlave) needs no change: its next_multi_read()
-// loop already auto-increments the address per INCR beat.
-//
-// The burst call blocks this module's own SC_THREAD while it traverses the
-// arbiter + slave; the pipeline thread meanwhile just polls resp_valid. The
-// sc_signal handshake latency each way is the "wrapper overhead" absorbed by
-// the slave-latency calibration (N_slave = target - overhead).
+// A refill is an INCR burst of LINE_WIDTH/AxiDataWidth beats, as in
+// wt_axi_adapter.sv (2 beats for a 16 B line on 64 bits). The burst blocks
+// this module's thread while the pipeline polls resp_valid. The extra cycles
+// of the signal handshake are absorbed in the fitted slave latency.
 #pragma once
 
 #include "axi4_segment.h"
@@ -38,24 +27,18 @@ public:
   r_master<AUTO_PORT>  r_master0;
   w_master<AUTO_PORT>  w_master0;
 
-  // Pipeline-facing handshake (driven/read by CPURV64P6_Cycle).
+  // Handshake with the CPU.
   sc_in<bool>          req_valid;
   sc_in<uint32_t>      req_addr;
   sc_in<bool>          req_is_write; // false=read (I$/D$), true=write (store-drain)
-  // The CPU's real value: for a write, the data being stored; for a read, the
-  // value already fetched via mem_intf/fetch_instruction (see
-  // AxiContentionTop::request()'s doc comment) -- widened to 64 bits so it
-  // can hold a full doubleword (e.g. `ld`), not just the low 32 bits.
+  // Store data, or for a read the value the CPU already read. 64 bits so a
+  // ld fits.
   sc_in<uint64_t>      req_wdata;
   sc_out<bool>         resp_valid;
   sc_out<uint64_t>     resp_data;
 
-  // 16 B line / 8 B (64-bit) beats = 2 beats -- matches CVA6's
-  // AxiRdBlenIcache/Dcache = ICACHE_LINE_WIDTH/AxiDataWidth - 1 = 1 (=2 beats).
-  // Runtime-overridable (VP_AXI_BEATS env var, see CPU_P64_6_Cycle.cpp) for
-  // side-by-side "what if AxiDataWidth were wider" experiments ONLY -- CVA6
-  // RTL always uses 2 beats at its real 64-bit AXI width. Do not use a
-  // non-default beat count as an RTL-accuracy claim.
+  // 2 beats per 16 B line on the 64-bit bus, as in CVA6. VP_AXI_BEATS changes
+  // it for experiments; other values are not checked against RTL.
   int burst_beats_ = 2;
 
   SC_HAS_PROCESS(AxiRefillMaster);
@@ -71,10 +54,8 @@ public:
     async_reset_signal_is(rst_bar, false);
   }
 
-  // Real AXI INCR burst read: one AR (len = BURST_BEATS-1), then BURST_BEATS
-  // R beats. The library's r_master only exposes single_read() (len=0), so
-  // this pushes/pops the raw ar/r ports directly, the same way r_master's own
-  // helpers do internally.
+  // INCR burst: one AR with len = beats-1, then that many R beats. matchlib's
+  // r_master only has single_read(), so this uses the ar/r ports directly.
   r_payload burst_read(uint32_t addr) {
     ar_payload ar_item;
     ar_item.addr = addr;
@@ -84,7 +65,7 @@ public:
 
     r_payload r;
     for (int beat = 0; beat < burst_beats_; beat++)
-      r = r_master0.r.Pop(); // block for each beat; last beat completes the miss
+      r = r_master0.r.Pop(); // the last beat ends the refill
     return r;
   }
 
@@ -104,19 +85,14 @@ public:
         w_master0.single_write(addr, req_wdata.read()); // blocks through arbiter+slave
         resp_data.write(0);
       } else {
-        // Real AXI INCR burst (burst_beats_ beats) through arbiter+slave --
-        // preserves exact timing/arbitration. The burst's own data (from
-        // MinimalAxiMemSlave's self-contained toy array) is intentionally
-        // discarded: resp_data carries the CPU's real fetched value instead
-        // (set via req_wdata -- see AxiContentionTop::request()/
-        // set_pending_wdata()), so the channel is data-correct, not just
-        // timing-correct.
+        // The burst gives the timing; its data is dropped and resp_data
+        // returns req_wdata instead.
         burst_read(addr);
         resp_data.write(req_wdata.read());
       }
 
-      // Signal completion and hold until the pipeline acknowledges by
-      // dropping req_valid (prevents re-triggering the same miss).
+      // Hold resp_valid until the CPU drops req_valid, so the same miss
+      // isn't started twice.
       resp_valid.write(true);
       while (req_valid.read()) wait();
       resp_valid.write(false);

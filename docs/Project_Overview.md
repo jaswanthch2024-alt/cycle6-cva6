@@ -1,6 +1,9 @@
-# RISC-V TLM Virtual Platform – Project Overview
+# RISC-V TLM Virtual Platform â€“ Project Overview
 
-This document summarizes the structure and behavior of the SystemC/TLM RISC?V virtual platform contained in this repository.
+> **Historical document** from early in the project; parts no longer match the
+> code. See the [README](../README.md) for the current model.
+
+This document summarizes the structure and behavior of the SystemC/TLM RISC-V virtual platform contained in this repository.
 
 ## Build and Dependencies
 - CMake (>= 3.10), C++17, Ninja generator

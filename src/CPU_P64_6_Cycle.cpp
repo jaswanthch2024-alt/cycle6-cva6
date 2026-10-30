@@ -21,6 +21,23 @@ static inline int clz64(uint64_t val) {
   return n;
 }
 
+// Latency of CVA6's serial divider (paper Section IV-E). A and B are the
+// operands as the divider sees them: already sign- or zero-extended for the
+// 32-bit *W forms. The leading-zero difference gives the number of quotient
+// bits; 1 cycle for B = 0, B = -1 (signed) or a zero quotient.
+static int serial_div_cycles(uint64_t A, uint64_t B, bool is_signed) {
+  const bool a_neg = is_signed && (static_cast<int64_t>(A) < 0);
+  const bool b_neg = is_signed && (static_cast<int64_t>(B) < 0);
+  const uint64_t a_in = a_neg ? (~A + 1) : A;
+  const uint64_t b_in = b_neg ? ~B : B;
+  const int shift_a = (a_in == 0) ? 64 : clz64(a_in);
+  const int div_shift = clz64(b_in) - shift_a;
+  const bool b_zero = (b_in == 0) && !b_neg;
+  const bool b_neg_one = (b_in == 0) && b_neg;
+  if (div_shift < 0 || b_zero || b_neg_one) return 1;
+  return div_shift + 6;
+}
+
 CPURV64P6_Cycle::CPURV64P6_Cycle(sc_core::sc_module_name const &name,
                                  BaseType PC, bool debug)
     : CPU(name, debug) {
@@ -2074,33 +2091,8 @@ void CPURV64P6_Cycle::EX_stage() {
 
       int div_cycles = 1;
       if (is_div_op) {
-        uint64_t A = issue_ex_reg.rs1_val;
-        uint64_t B = issue_ex_reg.rs2_val;
         bool is_signed = (issue_ex_reg.funct3 == 4 || issue_ex_reg.funct3 == 6);
-        bool op_a_sign = is_signed && (static_cast<int64_t>(A) < 0);
-        bool op_b_sign = is_signed && (static_cast<int64_t>(B) < 0);
-
-        uint64_t lzc_a_input = op_a_sign ? (~A + 1) : A;
-        uint64_t lzc_b_input = op_b_sign ? ~B : B;
-
-        int lzc_a_result = clz64(lzc_a_input);
-        int lzc_b_result = clz64(lzc_b_input);
-
-        bool lzc_a_no_one = (lzc_a_input == 0);
-        bool lzc_b_no_one = (lzc_b_input == 0);
-
-        int shift_a = lzc_a_no_one ? 64 : lzc_a_result;
-        int div_shift = lzc_b_result - shift_a;
-
-        bool op_b_zero = lzc_b_no_one && !op_b_sign;
-        bool op_b_neg_one = lzc_b_no_one && op_b_sign;
-        bool div_res_zero = (div_shift < 0);
-
-        if (div_res_zero || op_b_zero || op_b_neg_one) {
-          div_cycles = 1;
-        } else {
-          div_cycles = div_shift + 6;
-        }
+        div_cycles = serial_div_cycles(issue_ex_reg.rs1_val, issue_ex_reg.rs2_val, is_signed);
       }
 
       fu.remaining = is_div_op ? div_cycles : 1;
@@ -2256,31 +2248,7 @@ void CPURV64P6_Cycle::EX_stage() {
           A = static_cast<uint64_t>(static_cast<uint32_t>(issue_ex_reg.rs1_val));
           B = static_cast<uint64_t>(static_cast<uint32_t>(issue_ex_reg.rs2_val));
         }
-
-        bool op_a_sign = is_signed && (static_cast<int64_t>(A) < 0);
-        bool op_b_sign = is_signed && (static_cast<int64_t>(B) < 0);
-
-        uint64_t lzc_a_input = op_a_sign ? (~A + 1) : A;
-        uint64_t lzc_b_input = op_b_sign ? ~B : B;
-
-        int lzc_a_result = clz64(lzc_a_input);
-        int lzc_b_result = clz64(lzc_b_input);
-
-        bool lzc_a_no_one = (lzc_a_input == 0);
-        bool lzc_b_no_one = (lzc_b_input == 0);
-
-        int shift_a = lzc_a_no_one ? 64 : lzc_a_result;
-        int div_shift = lzc_b_result - shift_a;
-
-        bool op_b_zero = lzc_b_no_one && !op_b_sign;
-        bool op_b_neg_one = lzc_b_no_one && op_b_sign;
-        bool div_res_zero = (div_shift < 0);
-
-        if (div_res_zero || op_b_zero || op_b_neg_one) {
-          div_cycles = 1;
-        } else {
-          div_cycles = div_shift + 6;
-        }
+        div_cycles = serial_div_cycles(A, B, is_signed);
       }
 
       fw.remaining = is_div_w ? div_cycles : 1;
@@ -3825,7 +3793,7 @@ void CPURV64P6_Cycle::printStats() const {
             << "  (cycles where 2 instrs committed)\n";
   std::cout << "  Load->addr bubbles: " << stats.load_addr_events
             << "  (B9 gather/pointer-chase penalties)\n";
-  std::cout << "  DIAG I\$+D\$ co-stall cycles: " << diag_costall_cycles
+  std::cout << "  DIAG I$+D$ co-stall cycles: " << diag_costall_cycles
             << "  (I$ miss AND D$ miss both active same cycle)\n";
   std::cout << "  DIAG zero-commit cycles: " << diag_zero_commit_cycles
             << "  (" << (stats.cycles > 0 ? 100.0 * diag_zero_commit_cycles / stats.cycles : 0)

@@ -1,0 +1,5 @@
+cache_sweep
+icache_sweep
+reuse_distance
+*_trace*.txt
+cache_sweep_results.csv

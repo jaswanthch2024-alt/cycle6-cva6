@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Dump kernel instructions at a specific PC from the flat Image file."""
-import struct, sys
+import os, struct, sys
 
-IMAGE = "/mnt/c/Users/jaswa/RISCV-VP/boot/Image"
+IMAGE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "boot", "Image")
 # Kernel Image file: 64-byte header, then code starting at virtual 0xffffffff80200000
 # Physical load address: 0x80200000
 # The Image file maps: file[64 + N] → PA 0x80200000 + N → VA 0xffffffff80200000 + N

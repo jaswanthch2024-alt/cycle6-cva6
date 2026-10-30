@@ -8,9 +8,6 @@
 cmake_minimum_required(VERSION 3.10)
 project(RISCV_VP)
 
-# Prefer Ninja generator if available
-message(STATUS "Using Ninja generator")
- 
 # Use C++20 on MSVC to support [[likely]] attribute; otherwise default to 17
 if(MSVC)
   set(CMAKE_CXX_STANDARD 20)
@@ -32,11 +29,12 @@ option(ENABLE_STRICT "Treat warnings as errors" OFF)
 option(BUILD_DOC "Build documentation" ON)
 option(BUILD_TESTING "Build tests" OFF)
 option(ENABLE_PIPELINED_ISS "Enable pipelined ISS" ON)
-option(USE_LOCAL_SYSTEMC "Use vendored SystemC located in systemc/ subdir" ON)
+option(USE_LOCAL_SYSTEMC "Use the vendored SystemC in systemc/ (OFF: use an installed SystemC)" ON)
 option(BUILD_ROBUST_HEX "Build robust_system_test hex images" ON)
 
-# Timing Model Selection (mutually exclusive)
-set(TIMING_MODEL "LT" CACHE STRING "CPU Timing Model: LT, AT, CYCLE, CYCLE6, CYCLE6_AXI, CYCLE6_AXI128, CYCLE6_AXI256, CYCLE6_AXI512, or CYCLE6_AXI1024")
+# Timing Model Selection (mutually exclusive). CYCLE6_AXI is the build validated
+# against the CVA6 RTL; LT, AT and CYCLE are the original RISC-V-TLM models.
+set(TIMING_MODEL "CYCLE6_AXI" CACHE STRING "CPU Timing Model: LT, AT, CYCLE, CYCLE6, CYCLE6_AXI, CYCLE6_AXI128, CYCLE6_AXI256, CYCLE6_AXI512, or CYCLE6_AXI1024")
 set_property(CACHE TIMING_MODEL PROPERTY STRINGS "LT" "AT" "CYCLE" "CYCLE6" "CYCLE6_AXI" "CYCLE6_AXI128" "CYCLE6_AXI256" "CYCLE6_AXI512" "CYCLE6_AXI1024")
 
 # Validate timing model
@@ -50,21 +48,22 @@ message(STATUS "========================================")
 
 include_directories(./inc/)
 
-# Try system installation first
-find_package(SystemC QUIET)
-
-if(NOT SystemC_FOUND AND USE_LOCAL_SYSTEMC)
-  if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/systemc/CMakeLists.txt")
-    message(STATUS "SystemC not found via find_package. Using local systemc/ subdirectory.")
-    add_subdirectory(systemc)
-    # The upstream build usually defines target 'systemc'. Provide an alias matching find_package usage.
-    if(TARGET systemc AND NOT TARGET SystemC::systemc)
-      add_library(SystemC::systemc ALIAS systemc)
-    endif()
-    set(SystemC_INCLUDE_DIRS "${CMAKE_CURRENT_SOURCE_DIR}/systemc/src")
-  else()
-    message(FATAL_ERROR "SystemC not found. Clone it into systemc/ or install it so find_package(SystemC) works.")
+# SystemC: the vendored copy by default, so every machine builds against the
+# same version. The CYCLE6_AXI* builds also need SystemC's internal kernel
+# headers (used by MatchLib), which installed packages usually do not ship.
+if(USE_LOCAL_SYSTEMC)
+  if(NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/systemc/CMakeLists.txt")
+    message(FATAL_ERROR "systemc/ is empty. Run: git submodule update --init systemc spdlog\n"
+                        "(or configure with -DUSE_LOCAL_SYSTEMC=OFF to use an installed SystemC)")
   endif()
+  message(STATUS "Using vendored SystemC in systemc/")
+  add_subdirectory(systemc)
+  if(TARGET systemc AND NOT TARGET SystemC::systemc)
+    add_library(SystemC::systemc ALIAS systemc)
+  endif()
+  set(SystemC_INCLUDE_DIRS "${CMAKE_CURRENT_SOURCE_DIR}/systemc/src")
+else()
+  find_package(SystemC REQUIRED)
 endif()
 
 if(TARGET SystemC::systemc)
@@ -75,11 +74,11 @@ endif()
 
 message(STATUS "SystemC include dirs: ${SystemC_INCLUDE_DIRS}")
 
-# Prefer system spdlog, fall back to bundled
-find_package(spdlog CONFIG QUIET)
-if(NOT spdlog_FOUND)
-  message(STATUS "spdlog not found via package config. Using bundled spdlog subdirectory.")
+# spdlog: the bundled copy when present, otherwise an installed one.
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/spdlog/CMakeLists.txt")
   add_subdirectory(spdlog)
+else()
+  find_package(spdlog CONFIG REQUIRED)
 endif()
 
 # =============================================================================

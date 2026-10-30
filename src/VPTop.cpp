@@ -155,7 +155,11 @@ VPTop::VPTop(sc_core::sc_module_name const &name,
     // Create Bus and Peripherals
     // =========================================================================
     Bus = new riscv_tlm::BusCtrl("BusCtrl");
-    std::cout << "Bus: LT (Loosely-Timed)" << std::endl;
+#if defined(ENABLE_AXI_CONTENTION)
+    std::cout << "Bus: TLM-2.0 b_transport (data), AXI refill arbiter (I$/D$ timing)" << std::endl;
+#else
+    std::cout << "Bus: TLM-2.0 b_transport" << std::endl;
+#endif
 
     trace = new riscv_tlm::peripherals::Trace("Trace");
     timer = new riscv_tlm::peripherals::Timer("Timer");

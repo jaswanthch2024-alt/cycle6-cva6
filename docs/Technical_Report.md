@@ -1,5 +1,10 @@
 # RISC-V Virtual Platform — Technical Report
 
+> **Historical document.** This describes an early version of the model (gshare
+> predictor, LRU caches with 64 B lines, fixed miss penalties). The current model
+> differs in all of these; see the [README](../README.md) and the calibration log
+> [BUGS.md](BUGS.md). Current reference numbers: [tests/reference/](../tests/reference/).
+
 **Project:** CVA6-Aligned RISC-V 64-bit Virtual Prototype  
 **Platform:** SystemC 2.3.3 / TLM-2.0, C++17, WSL2 / Linux  
 **Status:** Linux 6.1.0 boots to BusyBox user-space shell  

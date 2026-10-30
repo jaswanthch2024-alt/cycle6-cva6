@@ -22,29 +22,30 @@ pipeline — cache geometry, replacement policy, predictor sizes, miss latencies
 against direct CVA6 RTL co-simulation, not assumed; see [`docs/BUGS.md`](docs/BUGS.md) for the
 full calibration history.
 
-**SystemC is fully vendored in this repo** (`systemc/`, ~47 MB) — a fresh clone needs nothing
-external beyond a C++17 compiler and CMake to build the default model.
+SystemC and spdlog are git submodules (`systemc/`, `spdlog/`), so clone with
+`--recursive`. Nothing else is needed beyond a C++17 compiler and CMake.
 
 ---
 
 ## Quick Start — Build & Test on Your Own Desktop
 
 ```bash
-git clone https://github.com/jaswanthch2024-alt/cycle6-cva6.git cycle6-cva6
+git clone --recursive https://github.com/jaswanthch2024-alt/cycle6-cva6.git cycle6-cva6
 cd cycle6-cva6
+# (already cloned without --recursive? run: git submodule update --init systemc spdlog)
 
-# Build the default cycle-accurate model
-mkdir -p build_cycle6 && cd build_cycle6
-cmake .. -DTIMING_MODEL=CYCLE6 -DCMAKE_BUILD_TYPE=Release
+# Build the RTL-validated model (CYCLE6_AXI is also the default TIMING_MODEL)
+mkdir -p build_axi && cd build_axi
+cmake .. -DTIMING_MODEL=CYCLE6_AXI -DCMAKE_BUILD_TYPE=Release
 make -j$(nproc)
 cd ..
 
-# Run a bare-metal test binary (fast, seconds)
-export LD_LIBRARY_PATH=build_cycle6:build_cycle6/systemc/src:build_cycle6/spdlog
-./build_cycle6/RISCV_VP -R 64 -f tests/hex/robust_fast64.hex --max-instr 3000000
+# Run a bare-metal benchmark (seconds): Table III int-alu, expect 2,400,130 cycles
+export LD_LIBRARY_PATH=build_axi:build_axi/systemc/src:build_axi/spdlog
+./build_axi/RISCV_VP -R 64 -f tests/hex/int_alu_bench.hex --max-instr 30000000
 
-# Boot Linux to a shell (slower, ~3-4 minutes wall-clock on a modern desktop)
-./build_cycle6/RISCV_VP -R 64 \
+# Boot Linux to a shell (about 7 minutes with this build)
+./build_axi/RISCV_VP -R 64 \
   --bios  boot/fw_jump.bin \
   --dtb   boot/vp.dtb \
   --kernel boot/Image \
@@ -67,13 +68,20 @@ RISCV-VP: Starting interactive shell...
 | Requirement | Notes |
 |---|---|
 | CMake ≥ 3.10 | |
-| C++17 compiler | GCC 9+ or Clang 10+ tested; this project was verified with GCC 13 |
-| Nothing else for the default build | SystemC and spdlog are vendored in-repo |
+| C++17 compiler | Verified with GCC 13.3 and GCC 15.2; both give identical cycle counts |
+| Nothing else | SystemC and spdlog come from the submodules |
 
-If a system-installed SystemC is found by `find_package(SystemC)` it is preferred; otherwise
-CMake automatically falls back to the vendored `systemc/` subdirectory
-(`-DUSE_LOCAL_SYSTEMC=ON`, the default) and builds it as part of the same `make` invocation —
-no separate SystemC install step is required.
+By default (`-DUSE_LOCAL_SYSTEMC=ON`) CMake builds the vendored `systemc/` as part of the same
+`make`, even if another SystemC is installed, so every machine uses the same version. The
+`CYCLE6_AXI*` builds need it: MatchLib uses SystemC kernel headers that installed packages
+usually leave out. `-DUSE_LOCAL_SYSTEMC=OFF` uses an installed SystemC instead.
+
+Any `VP_*` environment variable that is set changes the model, and the VP lists every one it
+sees at start-up (`env : ...`). Run with none set to get the configuration in the paper.
+
+To rebuild the benchmarks themselves, see [`tests/README.md`](tests/README.md): the published
+binaries come from GCC 7.5 and GCC 13.1, and the build scripts check that a rebuild is
+byte-identical.
 
 ### Troubleshooting: `No CMAKE_C_COMPILER could be found`
 
@@ -83,7 +91,7 @@ only an opt-in GCC Toolset (e.g. `gcc-toolset-13`) that needs activating first:
 
 ```bash
 export PATH=/opt/rh/gcc-toolset-13/root/usr/bin:$PATH   # adjust version to what's installed
-cmake .. -DTIMING_MODEL=CYCLE6 -DCMAKE_BUILD_TYPE=Release
+cmake .. -DTIMING_MODEL=CYCLE6_AXI -DCMAKE_BUILD_TYPE=Release
 ```
 
 (Verified: a genuinely fresh clone in this environment fails with "No CMAKE_C_COMPILER could be

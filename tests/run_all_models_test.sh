@@ -1,6 +1,6 @@
 #!/bin/bash
 # RISC-V-TLM Robust Test Runner - All Timing Models
-# Run via WSL: powershell.exe -Command "& wsl bash /mnt/c/Users/jaswa/source/repos/RISC-V-TLM/tests/run_all_models_test.sh"
+# Run from anywhere: bash tests/run_all_models_test.sh
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 HEX_DIR="$REPO/tests/hex"

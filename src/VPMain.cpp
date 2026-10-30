@@ -19,6 +19,12 @@
 #include <algorithm>
 #include <cstdlib>
 
+#if defined(_WIN32)
+#define environ _environ
+#else
+extern char **environ;
+#endif
+
 #include "VPTop.h"
 #include "Performance.h"
 #if defined(ENABLE_PIPELINED_ISS)
@@ -161,7 +167,13 @@ int sc_main(int argc, char* argv[]) {
 
     auto perf = Performance::getInstance();
 
-    std::cout << "RISC-V Virtual Prototype (Loosely-Timed with cycle counting)\n";
+#if defined(ENABLE_AXI_CONTENTION)
+    std::cout << "RISC-V Virtual Prototype (Cycle6, cycle-accurate, AXI refill arbitration)\n";
+#elif defined(ENABLE_CYCLE6_MODEL)
+    std::cout << "RISC-V Virtual Prototype (Cycle6, cycle-accurate, fixed miss penalties; not RTL-validated)\n";
+#else
+    std::cout << "RISC-V Virtual Prototype\n";
+#endif
     std::cout << "  file: " << opts.hex_file << "\n";
     std::cout << "  arch: " << (opts.cpu_type == riscv_tlm::RV32 ? "RV32" : "RV64") << "\n";
 #if defined(ENABLE_CYCLE6_MODEL) || defined(ENABLE_CYCLE_MODEL)
@@ -190,6 +202,15 @@ int sc_main(int argc, char* argv[]) {
     }
     if (opts.max_instructions > 0) {
         std::cout << "  max : " << opts.max_instructions << " instr\n";
+    }
+    // Environment overrides change timing or behaviour; show every one, since
+    // the model's own log only goes to vp.log.
+    for (char **e = environ; e && *e; ++e) {
+        const std::string kv(*e);
+        if (kv.rfind("VP_", 0) == 0 || kv.rfind("RVSIM_MEM_LAT_NS=", 0) == 0 ||
+            kv.rfind("DISABLE_DMI=", 0) == 0) {
+            std::cout << "  env : " << kv << "  (non-default setting)\n";
+        }
     }
 
     g_top = new vp::VPTop("vp_top", opts.hex_file, opts.cpu_type, opts.debug,

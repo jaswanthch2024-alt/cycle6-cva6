@@ -186,12 +186,9 @@ private:
 
     std::array<StoreBufferEntry, COMMIT_DEPTH> committed{};
     std::size_t commit_head{0}, commit_tail{0}, commit_count{0};
-
-    // Unused. CVA6 (store_buffer.sv) only compares address bits [11:3] and
-    // makes the load wait for the drain on a match; we compare byte ranges.
-    static bool alias_check(uint64_t a, uint64_t b) {
-        return (a & 0xFFFULL) == (b & 0xFFFULL);
-    }
+    // CVA6 (store_buffer.sv) compares only address bits [11:3] and makes the
+    // load wait for the drain on a match; this model compares byte ranges and
+    // forwards instead (paper Section IV-G).
 };
 
 } // namespace riscv_tlm

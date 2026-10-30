@@ -134,7 +134,12 @@ private:
     // recently touched), ==1 means "descend right". Ported verbatim from
     // tools/cache_sweep/RuntimeCache.h (see that file for the hand-traced
     // correctness proof).
-    static constexpr int WAYS_LOG2 = Cache::log2c(WAYS);
+    // log2c must be declared before its first use in a static member
+    // initialiser (GCC 15 and Clang reject a forward use).
+    static constexpr int log2c(std::size_t n) {
+        return (n <= 1) ? 0 : 1 + log2c(n >> 1);
+    }
+    static constexpr int WAYS_LOG2 = log2c(WAYS);
     std::size_t plru_find_victim(std::size_t set_idx) const {
         std::size_t node = 0;
         auto& bits = plru_bits[set_idx];
@@ -158,9 +163,6 @@ private:
     // per cache). Nonzero seed (an LFSR must never be all-zero).
     uint8_t lfsr{0xACu};
 
-    static constexpr int log2c(std::size_t n) {
-        return (n <= 1) ? 0 : 1 + log2c(n >> 1);
-    }
     static constexpr int OFFSET_BITS = log2c(LINE_BYTES);
     static constexpr int TAG_SHIFT   = log2c(LINE_BYTES) + log2c(SETS);
 

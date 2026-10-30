@@ -1,5 +1,10 @@
 # RISC-V VP — Bugs Found & Timing-Model Calibration (CVA6 co-simulation validation)
 
+> **This is a lab notebook, in the order the work was done.** Later sections
+> correct earlier ones, and some early numbers (accuracy tables, the "shift
+> bubble", LRU caches) are superseded. The final model's numbers are in
+> [tests/reference/reference.csv](../tests/reference/reference.csv) and §B15–§B17.
+
 This document records every functional bug and timing-model calibration gap found
 while validating the 6-stage cycle-accurate VP (`CPU_P64_6_Cycle`) against the
 **CVA6 RTL co-simulation** (`cv64a6_imafdc_sv39`, Verilated + matchlib/SystemC).

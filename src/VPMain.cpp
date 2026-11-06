@@ -22,7 +22,7 @@
 #if defined(_WIN32)
 #define environ _environ
 #else
-extern char **environ;
+extern "C" char **environ;
 #endif
 
 #include "VPTop.h"

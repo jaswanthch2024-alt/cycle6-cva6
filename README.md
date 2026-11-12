@@ -1,8 +1,9 @@
 # Cycle6: a cycle-accurate SystemC/TLM-2.0 virtual prototype of the CVA6 core
 
 A cycle-accurate, CVA6-aligned RISC-V 64-bit virtual platform implemented in SystemC/TLM-2.0.
-Boots **Linux 6.1.0** to a BusyBox user-space shell on the 6-stage pipeline model, and includes
-an optional real-AXI memory-contention model validated against CVA6 RTL co-simulation.
+Boots **Linux 6.1.0** to a BusyBox user-space shell on the 6-stage pipeline model. Cache refills
+are timed by a real MatchLib AXI arbiter (the default `CYCLE6_AXI` build), calibrated against
+CVA6 RTL co-simulation.
 
 [![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](https://www.gnu.org/licenses/gpl-3.0)
 [![C++17](https://img.shields.io/badge/C%2B%2B-17-blue.svg)](https://isocpp.org/)
@@ -14,7 +15,7 @@ an optional real-AXI memory-contention model validated against CVA6 RTL co-simul
 
 ## What This Is
 
-RISCV-VP is a pre-silicon software validation platform. It models the microarchitecture of the
+Cycle6 is a pre-silicon software validation platform. It models the microarchitecture of the
 **CVA6 (Ariane)** open-source application-class RISC-V processor at the cycle level, allowing
 software engineers to run real workloads (including a full Linux kernel) and obtain detailed
 pipeline performance statistics before silicon is available. Every timing constant in the
@@ -104,11 +105,11 @@ found" until this `PATH` export is done — Ubuntu/Debian/Fedora desktops with a
 
 | Model | `TIMING_MODEL` | Speed | Use Case |
 |-------|------|-------|----------|
-| LT (Loosely-Timed) | `LT` (default) | ~100 MIPS | Fast functional, software debug |
-| AT (Approximately-Timed) | `AT` | ~50 MIPS | Bus/interconnect latency analysis |
-| 2-Stage Cycle | `CYCLE` | ~10 MIPS | Basic hardware timing |
-| **6-Stage Cycle (Cycle6)** | `CYCLE6` | ~2–5 MIPS | **Full micro-arch simulation — the model this README describes** |
-| **6-Stage Cycle + real AXI contention** | `CYCLE6_AXI` | slower (Connections/matchlib) | Microbenchmark-only; models real I$/D$ AXI port contention, see below |
+| LT (Loosely-Timed) | `LT` | ~100 MIPS (not re-measured) | Fast functional, software debug |
+| AT (Approximately-Timed) | `AT` | ~50 MIPS (not re-measured) | Bus/interconnect latency analysis |
+| 2-Stage Cycle | `CYCLE` | ~10 MIPS (not re-measured) | Basic hardware timing |
+| 6-Stage Cycle (Cycle6), fixed miss penalties | `CYCLE6` | ~1 MIPS on the Linux boot (140 s, as in the paper) | Full micro-arch model without the AXI refill path; not the validated configuration |
+| **6-Stage Cycle + real AXI refill timing** | `CYCLE6_AXI` (**default**) | ~0.3 MIPS on the Linux boot (about 7 min) | **The RTL-validated model this README describes**; I$/D$ refills go through the MatchLib AXI arbiter, see below |
 
 ---
 
@@ -135,6 +136,7 @@ found" until this `PATH` export is done — Ubuntu/Debian/Fedora desktops with a
 | `0x0200_0000` | CLINT (timer + MSIP) |
 | `0x0C00_0000` | PLIC (external interrupts) |
 | `0x1000_0000` | UART 16550 (serial console) |
+| `0x3000_0000` | DMA (loosely-timed TLM master; no RTL reference) |
 | `0x8000_0000` | DRAM — 512 MB (OpenSBI + DTB + kernel + initrd) |
 | `0x8000_1000` | HTIF tohost (riscv-tests pass/fail) |
 
@@ -199,7 +201,8 @@ mispredicted 58% more than the RTL on CoreMark.
 
 Linux 6.1.0 boots to the BusyBox shell on the frozen default configuration (AXI build):
 **136,596,724 instructions / 222,179,066 cycles, IPC 0.615**, 4.27M mispredicts (76.5% predict
-rate), 426 s wall-clock (0.32 MIPS, measured with other simulations running on the host).
+rate), about 7 min wall-clock (426 s in the run above with other simulations on the host; 386–470 s
+across runs, so roughly 0.3 MIPS).
 With the original VP predictor the same boot mispredicted twice as often (8.31M, 56.3%,
 IPC 0.586); the paper's 0.597 was measured on that older model. There is no RTL reference for
 Linux boot (the co-sim testbench cannot boot Linux), so boot IPC shows the model's behaviour, not
@@ -219,8 +222,10 @@ fixed, see `docs/BUGS.md` §B14.
 Cache geometry, replacement policy, and I$ miss latency are all directly matched/re-derived
 against CVA6 RTL — see `docs/BUGS.md` §B8 (LRU→LFSR replacement fix, was over-missing by ~22%)
 and §B10 (I$ miss penalty re-derived from 10→7 cycles via an isolated single-cache benchmark,
-matched to 0.046% error). **D$ miss penalty (10 cycles) has not yet been independently
-re-derived the same way — a known open item, likely similarly over-stated.**
+matched to 0.046% error). The 7 and 10 cycle penalties are the fixed fallback of the non-AXI
+`CYCLE6` build. In the default `CYCLE6_AXI` build a miss costs the AXI refill plus, for the D$, a
+fill tail re-derived from isolated miss probes (`dmiss_extra=5`, `dmiss_block=3`, `docs/BUGS.md`
+§B15); `dmiss_d16` now matches the RTL to 0.0%.
 
 `Cache.h` implements six replacement policies — **LFSR** (default, matches CVA6 silicon), **LRU**,
 **MRU**, **PLRU**, **NRU**, and **LFU** — selectable independently per cache at runtime via
@@ -240,12 +245,12 @@ pattern to exploit. See `docs/BUGS.md` §B8.
 | Unit | Latency | Instructions |
 |------|---------|-------------|
 | ALU | 1 cycle | All integer arithmetic/logic |
-| Load (D$ hit) | 1 cycle + 1 stall | LB / LH / LW / LD — RTL doc states 3 cycles; open investigation, see `docs/BUGS.md` §B11 |
-| Load (D$ miss) | 10 cycles | LB / LH / LW / LD |
+| Load (D$ hit) | 3-cycle hit latency, pipelined (use at distance 1 stalls 2 cycles) | LB / LH / LW / LD — measured on the RTL, `docs/BUGS.md` §B11 (default `VP_LOAD_LAT=2`) |
+| Load (D$ miss) | AXI refill + 4-cycle fill tail (10 cycles in the non-AXI build) | LB / LH / LW / LD, `docs/BUGS.md` §B15 |
 | Load→address dependency | +2 cycles (on top of the above) | Only when the loaded value feeds a subsequent load/store address (gather patterns) |
 | Store | 0 (buffered) | SB / SH / SW / SD — verified against RTL to be genuinely free (CVA6's write-through buffer absorbs stores), see `docs/BUGS.md` §B7 |
 | MUL | 2 cycles | MUL / MULH / MULHU / MULHSU / MULW |
-| DIV | Operand-dependent, ~1–70 cyc | DIV / DIVU / REM / REMU + W-variants; early-terminating serial divider (latency ∝ significant quotient bits, matches CVA6 to within ~0.6%) |
+| DIV | Operand-dependent, ~1–70 cyc | DIV / DIVU / REM / REMU + W-variants; early-terminating serial divider (latency ∝ significant quotient bits); `div_stress` is +1.74% against the RTL, see the divider section below |
 | FPU | 2–14 cycles | F / D extension operations |
 | CSR | 1 cycle (at commit) | CSRRW / CSRRS / CSRRC / CSRRWI / … |
 
@@ -309,18 +314,20 @@ design.
 
 ---
 
-## AXI Contention Model (`CYCLE6_AXI` / `CYCLE6_AXI128`) — optional, microbenchmark-only
+## AXI Contention Model (`CYCLE6_AXI` is the default build; `CYCLE6_AXI128`–`1024` are comparison-only)
 
-A separate, opt-in build mode that models real AXI-level contention between the I$ and D$ AXI
-manager ports using an actual **NVIDIA matchlib `AxiArbiter`** (not a hand-rolled stand-in) —
+The default build mode. It times the I$ and D$ refills on AXI manager ports through an actual
+**NVIDIA matchlib `AxiArbiter`** (not a hand-rolled stand-in) —
 vendored from the public [Stuart-Swan Matchlib-Examples-Kit](https://github.com/Stuart-Swan/Matchlib-Examples-Kit-For-Accellera-Synthesis-WG)
 into `third_party/matchlib_kit/` (13 MB, trimmed, license files retained), which builds against
 this project's own SystemC **3.0.2** — no Catapult HLS license required.
 
 ### What it models
 
-- I$ and D$ modelled as **two independent AXI masters** contending for one arbitrated memory
-  port, matching CVA6's real single AXI manager port.
+- I$ and D$ modelled as **two independent AXI masters** sharing one arbitrated memory port, so a
+  refill of one cache makes the other wait. CVA6 itself gives I$ and D$ separate AXI transaction
+  IDs (`wt_axi_adapter.sv`) and overlaps their misses, so the VP is slower than the RTL when both
+  caches miss together (`mem_contention` +5.1%, `docs/BUGS.md` §B7, §B15).
 - **Genuine multi-beat AXI INCR bursts** per cache-line refill, beat count derived from **each
   cache's own configured line width** independently (`Cache<>::LineBytes ÷ (AxiDataWidth/8)`) —
   at the default 64-bit AXI width and 16-byte line, that's 2 beats per line, matching CVA6's own
@@ -337,8 +344,12 @@ this project's own SystemC **3.0.2** — no Catapult HLS license required.
   of DTLB-miss-combined page-table-walk cases. Note: this makes the *timing* channel
   functionally data-correct in simulation; it does not add an external AXI port anything
   outside the VP could bind to (see caveats below).
-- The default `CYCLE6` build's core pipeline logic is **completely untouched** by this mode —
-  verified bit-exact when `CYCLE6_AXI`/`CYCLE6_AXI128` is not selected.
+- The `CYCLE6` build's core pipeline logic is **untouched** by this mode — verified bit-exact when
+  `CYCLE6_AXI`/`CYCLE6_AXI128` is not selected.
+- Only I$ and D$ refills use the arbiter. Stores, page-table walks, DMA and MMIO functional
+  accesses go over TLM only. The AMO/LR/SC path does not model its own D$ miss or AXI refill, and
+  in the AXI build the page-walk cost is not consistently charged to the pipeline
+  (`docs/DVCON_AUDIT_2026-10-06/report.md` F03, F05).
 
 ### Runtime comparison switches (single build, env-var toggle — no rebuild needed)
 
@@ -368,7 +379,11 @@ AXI (`AxiDataWidth=64` in every `cva6_config_pkg.sv`), so all four wider variant
 new, uncalibrated-against-RTL comparison points — useful for isolating "what does a wider bus buy
 you," not for an RTL-accuracy claim.
 
-| | 64-bit AXI (`CYCLE6_AXI`) | 128-bit | 256-bit | 512-bit | 1024-bit |
+Cycle counts in this subsection were measured on the model **before** the frozen defaults
+(old predictor, D$-hit latency 1, no D$ fill tail) and were not re-run. For the frozen model see
+[`docs/EXPLORATION.md`](docs/EXPLORATION.md) (Linux boot with 128 B lines, 1024-bit bus, 256 KB D$).
+
+| (pre-freeze model) | 64-bit AXI (`CYCLE6_AXI`) | 128-bit | 256-bit | 512-bit | 1024-bit |
 |---|---:|---:|---:|---:|---:|
 | Beats per 16 B line refill | 2 | 1 | 1 | 1 | 1 |
 | `mem_contention_bench` cycles | 4,266,611 | 3,836,662 | 3,836,662 | 3,836,662 | 3,836,662 |
@@ -391,7 +406,7 @@ costing less to service (fewer AXI beats), never from catching more hits.
 
 #### 1024-bit AXI + 1024-byte cache lines (combined, directional experiment)
 
-`CYCLE6_AXI1024` build with both L1 line widths changed from 16 B to 1024 B
+`CYCLE6_AXI1024` build (pre-freeze model, not re-run) with both L1 line widths changed from 16 B to 1024 B
 (`Cache<256, 4, 1024>` / `Cache<256, 8, 1024>` in `inc/CPU_P64_6_Cycle.h`; sets and ways held
 fixed, so capacity grows to **1 MB I$ / 2 MB D$**). Not a shipped configuration — the header was
 edited only for this run and reverted afterwards.
@@ -406,8 +421,9 @@ edited only for this run and reverted afterwards.
 - `mem_contention_bench` (64 KB region) fits entirely in the inflated caches, so it only shows
   "everything hits". Linux boot is large enough to keep missing even against 1 MB / 2 MB caches,
   which is why it was used as the real-workload check.
-- Linux boot: −12% cycles, IPC 0.586 → 0.662. Mispredicts are unchanged (8.30M vs 8.31M), so the
-  gain is entirely from memory stalls.
+- Linux boot: −12% cycles, IPC 0.586 → 0.662 (old predictor, which mispredicted twice as often as
+  the frozen one). Mispredicts are unchanged (8.30M vs 8.31M), so the gain is entirely from memory
+  stalls.
 - **This does not isolate bus width.** Line size, cache capacity (16/32 KB → 1/2 MB) and AXI width
   all changed together, and most of the miss reduction comes from the capacity increase. Isolating
   the bus-width contribution would need a capacity-matched run (for example 1024 B lines with the
@@ -447,23 +463,28 @@ VP_DCACHE_SLOTS=8 ./build_cycle6_axi/RISCV_VP -R 64 -f tests/hex/robust_fast64.h
 ```
 
 The `-DTIMING_MODEL=CYCLE6_AXI`/`CYCLE6_AXI128` binaries run any bare-metal `.hex` the same way
-as the default build. The specific stress test used to derive the results below was a dedicated
-I$+D$ concurrent-thrash workload built during calibration; it is not included in this repo, but
-any memory-heavy bare-metal program will exercise the same contention path.
+as the default build. The I$+D$ concurrent-thrash workload behind the results below is `mem_contention_bench`
+(source in `tests/full_system/`, image `tests/hex/mem_contention_bench.hex`).
 
 ### Verified results (I$+D$ concurrent-contention stress test)
 
-| | CVA6 RTL | VP — No AXI | VP — With AXI (2-beat burst) |
-|---|---:|---:|---:|
-| Cycles | 4,334,798 | 4,111,121 | **4,266,611** |
-| IPC | 0.378 | 0.399 | **0.384** |
-| Error vs RTL | — | −5.2% | **−1.57%** |
+Frozen default configuration, same ELF on both sides (`docs/BUGS.md` §B15):
 
-Once both the underlying miss-latency calibration and the AXI subsystem's own separate
-`axi_slave_latency` constant were correctly derived and kept in sync, real AXI contention
-modelling with genuine burst semantics measurably improved accuracy over the no-AXI baseline.
-Full investigation, including the earlier (now-resolved) finding that a naively-calibrated AXI
-model made things *worse*, is documented in `docs/BUGS.md` §B7/§B10.
+| | CVA6 RTL | VP — AXI build |
+|---|---:|---:|
+| Instructions | 1,638,453 | 1,638,453 |
+| Cycles | 4,334,798 | 4,554,375 |
+| IPC | 0.378 | 0.360 |
+| Error vs RTL | — | **+5.07%** |
+
+An earlier calibration matched this benchmark to −1.57% (VP 4,266,611 cycles), but only because
+`axi_slave_latency` had been tuned on it while the D$ fill tail was still missing. With the fill
+tail fitted on isolated D$ miss probes and the AXI latency kept, the residual is +5.1%. Its cause
+is that the VP serialises I$ and D$ refills through one arbiter while CVA6 overlaps them
+(`docs/BUGS.md` §B7 cause 2, §B15). Giving the VP overlapping I$/D$ refills is the open fix.
+
+Full investigation, including the earlier finding that a naively-calibrated AXI model made things
+*worse*, is in `docs/BUGS.md` §B7, §B10 and §B15.
 
 ---
 
@@ -498,7 +519,7 @@ benchmark's own timed region (its CSR counter readings) on both sides:
 | fp_bench / fp_stress | 2,600,478 / 6,200,440 | 2,609,563 / 6,400,140 | +0.35% / +3.22% |
 | CoreMark (2K perf run, 10 iter., CRCs validated) | 5,121,158 | 5,243,331 | +2.39% |
 | Dhrystone (2000 runs) | 1,113,360 | 1,094,827 | −1.66% |
-| median | 4,159,515 | 4,209,243 | +1.20% |
+| median (same ELF, `tests/median/`) | 3,774,612 | 4,030,227 | +6.77% (IPC −6.34%) |
 | SpMV, double precision | 99,142 | 99,017 | −0.13% |
 | SpMV, integer | 1,262,614 | 1,287,672 | +1.98% |
 | ptr_chase | 3,205,274 | 3,205,500 | +0.01% |
@@ -506,7 +527,9 @@ benchmark's own timed region (its CSR counter readings) on both sides:
 | locality (96 KB cold + 4 KB hot) | 7,439,113 | 6,898,872 | −7.26% |
 | mem_contention (I$+D$ stress) | 4,334,798 | 4,554,375 | +5.07% |
 
-Branch mispredict counts match the RTL within 0.7% on every benchmark. Full details and the
+`median` was first compared across two different binaries (+1.2%, now retracted); the row above
+is the same-ELF result, `docs/BUGS.md` §B17. Branch mispredict counts match the RTL within 0.7% on
+every benchmark. Full details and the
 measurements behind each calibration: `docs/BUGS.md` §B11–§B15.
 
 ### Known residual gaps (honestly stated, not yet closed)
@@ -516,9 +539,14 @@ measurements behind each calibration: `docs/BUGS.md` §B11–§B15.
 2. **Divider timing:** the RTL makes a same-register divide wait for the previous one to commit
    but overlaps result use with that wait; the VP does the opposite and over-charges trivial
    divides (div_stress +1.7%, §B15).
-3. **Misses interleaved with hits / I$+D$ overlap:** locality −7.3% with identical miss counts
-   (about 2 cycles per miss under-charged), mem_contention +5.1% (§B7, §B15, §B16).
-4. **No L2 cache.**
+3. **Misses interleaved with hits:** locality −7.3% with identical miss counts (about 2 cycles
+   per miss under-charged, §B15, §B16).
+4. **I$/D$ refill overlap:** the VP serialises the two refills, CVA6 overlaps them, so
+   mem_contention is +5.1% (§B7, §B15).
+5. **median +6.8% cycles:** branch counts and D$ misses match, so the cause is a pipeline effect
+   not yet isolated (§B17).
+6. **CoreMark +2.4%** and **integer SpMV +2.0%:** not isolated.
+7. **No L2 cache.**
 
 #### Divider validation (vs CVA6 RTL co-simulation)
 
@@ -528,7 +556,12 @@ A register-only 64-bit `div`/`rem` stress benchmark, bit-exact result agreement:
 |---------------|-------:|----:|---------------:|--------------:|
 | CVA6 RTL (reference) | 1,130,126 | 0.165 | ~47 | — |
 | VP — flat 66-cycle (old) | 1,483,431 | 0.126 | 65 | +31% |
-| **VP — operand-value early-termination (new)** | **1,123,900** | **0.166** | **47** | **−0.6%** |
+| VP — operand-value early-termination (first version) | 1,123,900 | 0.166 | 47 | −0.6% |
+| **VP — frozen default (with the same-register commit wait, §B12)** | **1,149,840** | | | **+1.74%** |
+
+The first early-termination version matched only because errors cancelled: the RTL makes a
+same-register divide wait for the previous one to commit but overlaps the result use, the VP does
+the opposite and over-charges trivial divides by about 3 cycles (`docs/BUGS.md` §B15).
 
 ---
 
@@ -539,6 +572,10 @@ A register-only 64-bit `div`/`rem` stress benchmark, bit-exact result agreement:
 | FP, divider and I$/D$-overlap residuals | See "Known residual gaps" above |
 | No L2 cache | D$ misses resolve directly to a flat penalty rather than escalating through an L2 |
 | `CYCLE6_AXI` covers only I$/D$ read contention | Store-drain and DMA contention deliberately not modelled — both evaluated and found unnecessary or unvalidatable, see the AXI section above |
+| Atomics (LR/SC/AMO) have no D$/AXI refill timing | They access memory directly after the store buffer drains (audit F03) |
+| Page-walk cost in the AXI build | The nominal 2 cycles per level is not consistently charged to the pipeline (audit F05) |
+| MMIO loads go through the D$ timing check | An ordinary UART load can count one D$ miss (audit F04) |
+| No RTL reference for Linux boot or DMA | The co-sim testbench runs bare-metal programs only |
 | RV32 6-stage model is not updated | Lacks cache model, CSR_File, MMU — suitable for bare-metal RV32 only |
 | No write-combining | Stores drain one at a time; real HW coalesces adjacent stores |
 | Single-core | No cache coherence protocol needed or modelled |
@@ -627,7 +664,7 @@ VP_BOOT_STATS=1 ./build_cycle6/RISCV_VP -R 64 \
 ## Project Structure
 
 ```
-RISCV-VP/
+cycle6-cva6/
 ├── src/
 │   ├── CPU_P64_6_Cycle.cpp   # 6-stage CVA6-aligned pipeline
 │   ├── CPU_P32_6_Cycle.cpp   # 6-stage RV32 pipeline (bare-metal only)
@@ -645,6 +682,7 @@ RISCV-VP/
 │   ├── Cache.h               # N-way set-associative cache; LFSR (matches CVA6) + LRU/MRU/PLRU/NRU/LFU comparison policies
 │   ├── MMU.h                 # sv39 ITLB + DTLB + page table walker
 │   ├── CSR_File.h            # Full M/S/U CSR file + interrupt logic
+│   ├── DMA.h                 # Loosely-timed DMA master (TLM)
 │   ├── CLINT.h               # Core-local interrupt controller
 │   ├── PLIC.h                # Platform-level interrupt controller
 │   ├── UART.h                # 16550 UART peripheral
@@ -670,10 +708,11 @@ RISCV-VP/
 │   ├── Image                 # Linux 6.1.0 kernel image
 │   └── initramfs.cpio.gz     # BusyBox root filesystem
 ├── systemc/                   # Vendored SystemC 3.0.2 (no external install needed)
-├── tests/hex/                 # Bare-metal Intel-HEX test binaries (only robust_fast64.hex and
-│                               #   dhrystone32.hex are tracked; the rest are local build output)
+├── tests/                     # Same-ELF VP/RTL benchmarks, see tests/README.md
+│   └── hex/                   # Committed Intel-HEX images of the benchmarks (31 tracked)
 ├── docs/
 │   ├── BUGS.md                 # Primary, current bug/calibration log — start here
+│   ├── EXPLORATION.md          # Linux boot with other D$ line sizes, bus widths, capacities (frozen model)
 │   ├── BUGS_AND_ISSUES.md      # Earlier bug log (pre-dates the calibration work in BUGS.md)
 │   ├── Technical_Report.md     # technical summary
 │   └── Project_Overview.md     # Structural overview
@@ -686,18 +725,24 @@ RISCV-VP/
 ## Bug & Calibration History
 
 The primary, current record of every bug, timing-model calibration gap, and validation result
-is [`docs/BUGS.md`](docs/BUGS.md) — organised as a lettered/numbered log (§A, §B1–§B11+),
+is [`docs/BUGS.md`](docs/BUGS.md) — organised as a lettered/numbered log (§A, §B1–§B17),
 each entry with symptom, root cause, fix, and the RTL co-simulation numbers used to verify it.
 Highlights from the most recent calibration pass:
 
 | § | Finding | Result |
 |---|---|---|
-| B6 | Branch-misprediction flush penalty was one cycle too cheap — the frontend-redirect bubble already charged on correctly-predicted taken branches (§B2) was never applied on the misprediction/flush path | `robust_stress` IPC error +2.8% → **~0.0%**, all seven control benchmarks unaffected. **⚠ But `flush_pipeline` covers 33 different redirect reasons (traps/interrupts/faults, not just mispredictions), and the fix applies the bubble to all of them uniformly, validated only against the branch case** — Linux boot IPC regressed 0.597 → 0.584 as a result. Real win on the isolated case, real regression on the full-system one; not yet re-scoped. See §B6. |
+| B6 | Branch-misprediction flush penalty was one cycle too cheap — the frontend-redirect bubble already charged on correctly-predicted taken branches (§B2) was never applied on the misprediction/flush path | `robust_stress` IPC error +2.8% → **~0.0%**, all seven control benchmarks unaffected. **⚠ But `flush_pipeline` covers 33 different redirect reasons (traps/interrupts/faults, not just mispredictions), and the fix applies the bubble to all of them uniformly, validated only against the branch case** — Linux boot IPC regressed 0.597 → 0.584 as a result. Real win on the isolated case, real regression on the full-system one; the 0.597 reference was later found stale, and the frozen boot IPC is 0.615. See §B6, §B14. |
 | B7 | AXI contention modelling investigated; store-drain and DMA contention evaluated and found unnecessary/unvalidatable | See "AXI Contention Model" above |
 | B8 | Cache replacement was LRU; CVA6 uses LFSR pseudo-random — LRU pathologically over-misses on scans larger than the cache | Miss counts corrected from ~22% error to <0.2% |
 | B9 | Load→address (gather/pointer-chase) dependency latency was under-modelled by ~2 cycles | Isolated pointer-chase test now matches RTL to 0.006% |
-| B10 | I$ miss latency was miscalibrated (10 cycles, should be 7); AXI burst mode implemented and its own latency constant re-derived to match | Memory-bound divergence reduced from up to +38.8% to as low as −1.57% (with recalibrated AXI burst mode) |
-| B11 | D$ hit latency: CVA6's own design doc states 3 cycles, VP models 1 — tested empirically (1/2/3 all measured against real RTL cycles), value 2 lands closest but overshoot/undershoot pattern suggests the real cause is the VP's `load_hit_fu` being a single blocking slot (can't hide latency behind independent work the way CVA6's scoreboard can), not the wrong flat constant | **Open** — root cause hypothesis identified, not yet fixed; see `docs/BUGS.md` §B11 |
+| B10 | I$ miss latency was miscalibrated (10 cycles, should be 7); AXI burst mode implemented and its own latency constant re-derived to match | Memory-bound divergence reduced from up to +38.8% to −1.57% on `mem_contention`; that match was later shown to rest on a latency tuned on the benchmark itself (now +5.1%, §B15) |
+| B11 | D$ hit latency: CVA6's own design doc states 3 cycles, VP models 1 — tested empirically (1/2/3 all measured against real RTL cycles), value 2 lands closest but overshoot/undershoot pattern suggests the real cause is the VP's `load_hit_fu` being a single blocking slot (can't hide latency behind independent work the way CVA6's scoreboard can), not the wrong flat constant | **Resolved by measurement** — the RTL hit latency is 3 cycles, pipelined; modelled by `load_hit_pipe`, default `VP_LOAD_LAT=2`; see §B11 |
+| B12 | The "shift bubble" was a misattribution: CVA6 issue waits for an earlier writer of the same destination register to commit | Same-register stall rule (default mode 1); integer microbenchmarks within 0.01% |
+| B13 | Co-sim memory model misplaced narrow stores (fixed in the testbench override); CoreMark validated; branch predictor aligned to CVA6 rules | CoreMark mispredicts −0.1% vs RTL, boot predict rate 56% → 77% |
+| B14 | `c.ebreak` scanned like `c.jalr` hung the boot under the CVA6 predictor | Fixed; Linux boot IPC 0.586 → 0.63 |
+| B15 | D$ miss fill tail, divider timing, frozen default configuration | Table in "Validation against CVA6 RTL" above |
+| B16 | FP timing aligned to CVA6 (same-register commit wait, latencies); locality and cache-sweep on RTL | fp_bench +0.35%, fp_stress +3.22% |
+| B17 | `median` had been compared across two different binaries | Same-ELF result +6.77% cycles |
 
 An earlier, separate 24-bug log covering the original Linux-boot bring-up (reset/init, ISA
 correctness, store buffer, MMU/TLB, privilege/interrupts, peripherals) is preserved in
@@ -709,7 +754,8 @@ correctness, store buffer, MMU/TLB, privilege/interrupts, peripherals) is preser
 
 Built on top of the [RISC-V TLM Simulator](https://github.com/mariusmm/RISC-V-TLM)
 originally developed by **Màrius Montón**. The TLM-2.0 infrastructure, memory model,
-and base ISA handlers originate from that work.
+bus, and the I, M and C instruction decoders (with local edits) originate from that work; the A extension was
+extended to RV64 (23 operations), and the F and D decoders are new.
 
 The optional AXI contention model uses **NVIDIA matchlib**, via the public
 [Stuart-Swan Matchlib-Examples-Kit-For-Accellera-Synthesis-WG](https://github.com/Stuart-Swan/Matchlib-Examples-Kit-For-Accellera-Synthesis-WG),
